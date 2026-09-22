@@ -1,0 +1,65 @@
+# --- Environment / secrets ---
+.env
+.env.local
+.env.*.local
+!.env.example
+
+# --- Python (backend) ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+venv/
+.venv/
+env/
+ENV/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+recovery_model.joblib
+*.csv
+!frontend/**/*.csv
+
+# --- Node / Next.js (frontend) ---
+node_modules/
+.next/
+out/
+build/
+dist/
+.turbo/
+*.tsbuildinfo
+next-env.d.ts
+.eslintcache
+
+# --- Testing / coverage ---
+coverage/
+.nyc_output/
+htmlcov/
+
+# --- Logs ---
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# --- OS / editor (Windows + cross-platform) ---
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+*.lnk
+.DS_Store
+.idea/
+.vscode/*
+!.vscode/extensions.json
+
+# --- Database ---
+*.sqlite3
+*.db
+
+# --- Misc build artifacts ---
+*.tsbuildinfo
+.vercel

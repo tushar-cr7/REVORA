@@ -1,0 +1,647 @@
+# CLAUDE.md — REVORA
+
+This file is the entry point for any Claude session working on this
+repository. Read this first, then inspect the specific files you need for
+the task at hand — the repository is the source of truth, not any prior
+conversation. Three other docs already exist at the repo root
+(`README.md`, `AGENTS.md`, `PROJECT_STRUCTURE.md`, `UI_DESIGN.md`) and
+remain valid background reading; this file summarizes and supersedes them
+where they've drifted from the current implementation, and adds the
+frontend design-identity and workflow context they don't cover.
+
+---
+
+## 1. Project Identity
+
+**REVORA** — Revenue Recovery Infrastructure.
+
+> Recover more revenue. Automatically. Safely.
+
+Core philosophy, verbatim, everywhere in this product:
+
+> **AI FOR INTELLIGENCE. RULES FOR CONTROL.**
+
+AI may identify patterns, estimate recovery probability, compare
+interventions, and explain decisions in plain language. It may never
+itself authorize money movement. A deterministic policy layer is the only
+thing that can approve, downgrade, or block an action, and the AI cannot
+override it. This split is REVORA's central trust claim, not a footnote —
+it shows up in the backend architecture, the API contract, and every page
+of the UI.
+
+---
+
+## 2. Product Purpose
+
+REVORA continuously runs one loop over a merchant's at-risk revenue:
+
+```
+DETECT → DIAGNOSE → PREDICT → DECIDE → ACT → MEASURE → LEARN
+```
+
+- **Detect** — find transactions where revenue is silently at risk: a
+  failed card, an abandoned checkout, a failed subscription renewal, an
+  overdue invoice.
+- **Diagnose** — categorize *why* (leak type, failure code, customer
+  context).
+- **Predict** — an ML model estimates recovery probability for that
+  specific leak.
+- **Decide** — score every candidate action by expected value and propose
+  the best one.
+- **Act** — execute the proposed action, but only if the deterministic
+  policy layer authorizes it.
+- **Measure** — record the real outcome (recovered / not recovered /
+  suppressed / escalated).
+- **Learn** — every decision and outcome is written to an audit trail.
+
+REVORA is positioned as **revenue recovery infrastructure**, not a
+generic "abandoned cart email" or reminder tool. The product's value claim
+is the combination of prediction, deterministic safety, and full
+auditability — not the recovery actions themselves (retry/reminder/link
+are common; the governance around them is not).
+
+---
+
+## 3. Product Principles
+
+- AI analyzes, predicts, recommends, and explains. It never executes
+  directly.
+- A deterministic policy engine (`backend/app/domain/policy.py`) is the
+  only authority that can approve, downgrade, reroute, or block a
+  proposed action. This relationship is one-way — policy can override the
+  AI; the AI can never override policy.
+- Recovery actions must stay within merchant-defined controls (retry
+  limits, cooldown periods, contact limits, an autonomous-recovery value
+  ceiling, escalation age thresholds).
+- Auditability and safety are first-class, not an afterthought. Every
+  decision — allowed or blocked — and every executed intervention is
+  recorded and independently retrievable via `/api/audit`,
+  `/api/decisions/{id}`, and `/api/interventions`.
+- **No fake functionality.** A button that says "Execute" calls the real
+  endpoint and renders the real response, including failure or a blocked
+  outcome. No hardcoded success states. No decorative numbers that can't
+  be computed from real pipeline output.
+
+---
+
+## 4. Current Product / Frontend
+
+All dashboard routes live under `frontend/app/(dashboard)/`, sharing the
+sidebar + header chrome in `frontend/app/(dashboard)/layout.tsx`. Titles
+and subtitles below are the real, current copy from each page's header.
+
+| Sidebar label | Route | Header subtitle (as shipped) |
+|---|---|---|
+| Revenue Command | `/mission-control` | "Where revenue is at risk, what REVORA is doing about it, and what's safe to execute." |
+| Revenue Scanner | `/revenue-scanner` | "REVORA looks inside your revenue universe" |
+| Recovery Brain | `/recovery-brain` | "How REVORA decides what revenue to recover" |
+| Transactions | `/transactions` | "Investigate revenue leaks and recovery opportunities." |
+| Interventions | `/interventions` | "Control and monitor revenue recovery actions." |
+| Recovery Controls | `/policies` | "Deterministic safety limits — these cannot be overridden by AI" |
+| Escalations | `/escalations` | "AI-proposed actions rerouted to merchant by the policy engine" |
+| Audit Trail | `/audit` | "Verifiable, immutable-style record of all decisions, policy gates & outcomes" |
+| Analytics | `/analytics` | "Recovery performance summary from backend pipeline" |
+| Integrations | `/integrations` | "Payment execution providers and external system connections" |
+| Settings | `/settings` | "System configuration and policy simulation" |
+| AI Copilot | `/copilot` | "Your intelligent assistant for revenue recovery" (sidebar-pinned, marked BETA) |
+
+A separate marketing site exists at `frontend/app/(marketing)/` (landing
+page, `/about`, `/contact`, `/how-it-works`, `/trust`) with its own
+layout, light-on-paper visual language, and route-transition into the
+dashboard — this is a distinct surface from the dark operational app and
+uses different design tokens (`paper`/`ink`/`hairline`/`accent`, see
+`tailwind.config.ts`).
+
+Nav structure and icon mapping are defined in
+`frontend/components/layout/Sidebar.tsx` — one Lucide icon per
+destination, reused consistently between the sidebar and that page's own
+header (see §10 and §6 of the icon system below).
+
+---
+
+## 5. Brand / Visual System
+
+**Direction:** premium fintech, dark, dense, sophisticated —
+Stripe-level financial discipline, Linear-level interaction quality,
+Razorpay-adjacent fintech credibility, wrapped in REVORA's own
+autonomous-recovery identity.
+
+**Explicitly avoid:** generic SaaS dashboard look, excessive
+glassmorphism, giant glowing AI orbs, rainbow/purple-everywhere gradients,
+default shadcn styling, huge empty hero sections, developer/research-console
+aesthetics, zebra-striped generic admin tables, 3D illustrations, confetti,
+emoji-as-UI. The full explicit ban list is in `UI_DESIGN.md` §9 and still
+applies.
+
+**Semantic color philosophy** (tokens defined in
+`frontend/tailwind.config.ts`, hex values match `UI_DESIGN.md` §1):
+
+| Meaning | Token family | Base hex |
+|---|---|---|
+| AI / intelligence / recommendation | `ai-*` (violet) | `#8B5CF6` |
+| Recovered / success / satisfied control | `success-*` (emerald) | `#10B981` |
+| Risk / blocked / policy violation | `risk-*` (coral/red) | `#F5484F` |
+| Attention / paused / escalation | `warning-*` (amber) | `#F5A623` |
+| System / navigation / neutral data | `primary-*` (indigo/blue) | `#4F6EF7` |
+
+A component gets **one** semantic accent color, chosen by which layer it
+belongs to. Violet is reserved for things that are literally AI-generated
+reasoning or recommendation — never used as decoration. This rule has held
+across every page rebuilt this project.
+
+Base surfaces are near-black navy, not pure black (`canvas` `#080B12`,
+`surface` `#0F141F`, `panel` `#131A26`) — see `tailwind.config.ts` for the
+full token set (borders, text, radii are also tokenized there).
+
+**Typography:** Geist Sans for UI text, Geist Mono for all currency
+figures, timestamps, transaction IDs, and percentages — this distinction
+is deliberate and load-bearing for the "infrastructure" feel; don't set a
+₹ amount in the sans typeface.
+
+**Brand/logo component:** `frontend/components/brand/RevoraLogo.tsx` is
+the single source-of-truth implementation. Raw logo/wordmark image assets
+live in `frontend/public/brand/`. Don't re-implement the mark inline
+elsewhere or reference the raw asset files directly from feature code —
+import the component.
+
+**Iconography:** Lucide only (`lucide-react`, already a dependency — do
+not add a second icon library). Each dashboard destination has exactly one
+coherent icon, defined once in `Sidebar.tsx` and reused in that page's own
+header for the same concept. See §10 for the current per-destination icon
+choices.
+
+---
+
+## 6. Product Language
+
+Prefer business-facing language everywhere in the UI:
+
+- Revenue at Risk · Potential Recovery · Recovered Revenue · Recovery Rate
+- Opportunities · Recovery Activity · Needs Attention
+- "REVORA recommends" · Safety check · Action paused · Recovery Controls
+
+Avoid surfacing by default:
+
+- Model names, ML internals, LLM implementation details
+- Expected-value formulas / raw probability math
+- Policy-engine implementation internals
+- Executor/provider architecture
+
+Technical detail is allowed, but belongs behind an explicit, secondary
+disclosure — literally labeled **"View technical details"** or presented
+as a separate **Technical** tab, collapsed/inactive by default. This
+pattern is already implemented in `TransactionDrawer.tsx` and
+`InterventionDetail.tsx` — reuse it rather than inventing a new pattern.
+
+---
+
+## 7. Backend Architecture
+
+FastAPI app, single router, no duplicate business logic anywhere (see
+`AGENTS.md` §1–2, still the binding rule).
+
+```
+backend/app/
+├── main.py                 # FastAPI app entry, CORS, startup model load
+├── config.py                # Settings (PORT, CORS_ORIGINS, etc.)
+├── api/
+│   ├── routes.py            # All /api/* endpoints
+│   └── schemas.py           # Pydantic request/response models
+├── domain/
+│   ├── models.py            # Transaction, Decision, Intervention, AuditEvent, Action enum
+│   └── policy.py            # PolicyLimits + evaluate_policy() — the ONLY authority on blocking/downgrading
+├── intelligence/
+│   ├── data_gen.py          # Synthetic transaction generator
+│   ├── model.py             # RecoveryModel — XGBoost P(recovery) classifier
+│   └── decision_engine.py   # decide_intervention() — expected-value scoring across candidates
+├── integrations/
+│   ├── base.py               # PaymentExecutionProvider interface
+│   └── simulation.py         # SimulationProvider — the only implementation today
+├── repositories/
+│   ├── base.py                # Abstract repository interface
+│   └── in_memory.py           # InMemoryRepository — the only implementation today
+└── services/
+    ├── recovery_service.py   # Orchestrates scan → analyze → decide → execute → recover
+    └── audit_service.py      # Structured audit log read/write
+```
+
+**Decision flow** (`decision_engine.decide_intervention`): for a leak's
+`leak_type`, only a fixed candidate action subset is scored (see
+`CANDIDATE_ACTIONS` in `decision_engine.py` — e.g. `abandoned_checkout`
+never considers `retry`). Each candidate's probability is
+`base_recovery_prob × ACTION_PROB_MULTIPLIER[action]`, expected value is
+`probability × amount − cost − friction`, highest EV wins, and the winner
+is passed to `evaluate_policy()` before anything is called "final."
+
+**Recovery actions** (closed vocabulary, `Action` enum in `models.py`):
+`retry` · `payment_link` · `reminder` · `escalate` · `suppress` (a
+deliberate no-action — recognized as a first-class outcome, not an
+omission).
+
+**Current policy defaults** (`backend/app/domain/policy.py`,
+`PolicyLimits` dataclass — read this file directly before assuming a
+number, it's configurable):
+
+| Limit | Default |
+|---|---|
+| Max retries | 2 |
+| Min cooldown between retries | 6 hours |
+| Max customer contacts per day | 1 |
+| Max autonomous-recovery value | ₹25,000 |
+| Max consecutive subscription failures before retry is blocked | 2 |
+| Invoice age before forced escalation | 30 days |
+
+`GET /api/policies` returns the live values — the frontend should always
+read from there (or from a `Decision`'s own `policy_reason`) rather than
+hardcoding these numbers.
+
+**Endpoints** (`backend/app/api/routes.py`, prefix `/api`):
+`GET /health` · `POST /scan` · `POST /analyze` · `GET /transactions` ·
+`GET /transactions/{id}` · `GET /opportunities` · `GET /decisions/{id}` ·
+`POST /interventions/{id}/execute` (`Idempotency-Key` header) ·
+`POST /recover` · `GET /interventions` · `GET /escalations` ·
+`GET /analytics` · `GET /audit` · `GET /policies` · `POST /simulate` ·
+`POST /demo/force-retry-block` · `POST /copilot/query`.
+
+Important: **`GET /opportunities` does not exclude transactions that have
+already been executed** — it returns every decided, non-suppressed
+transaction regardless of intervention history. The frontend derives "the
+real queue" itself by excluding transaction IDs already present in
+`/interventions` (see `frontend/components/interventions/interventionSignals.ts`
+→ `deriveQueue`). Don't assume the backend has already done this
+filtering.
+
+Also: **the same transaction can be executed more than once** — each call
+to `/interventions/{id}/execute` with a different idempotency key creates
+a new `Intervention` record. Frontend code that lists or sums
+interventions should dedupe to the most recent record per transaction
+(see `latestByTransaction` in the same file) to avoid double-counting
+recovered revenue or duplicate React keys.
+
+---
+
+## 8. Data / API Rules
+
+- Use real API/backend data whenever it's available. Never fabricate
+  timestamps, trend percentages, customer outcomes, recovery results, or
+  transaction states.
+- If a number can't be derived from real loaded data, don't display it —
+  omit the UI element rather than inventing a plausible-looking figure.
+  (Concrete precedent: an "In Progress" count can only ever honestly be 0
+  or 1 in the current architecture, because nothing is asynchronously
+  queued server-side — see §16.)
+- Preserve existing API contracts. Changing a response shape requires
+  updating both backend schema and frontend types
+  (`frontend/lib/types.ts`) in the same change, and is out of scope for a
+  pure frontend/design task.
+- All demo/synthetic data (`data_gen.py`) must remain clearly treated as
+  demo data — never described in UI copy as live/production figures.
+- The frontend never re-implements recovery probability, expected value,
+  or policy rules client-side, not even for optimistic UI. It renders
+  what `/api/*` returns, or an honest pending/loading/error state.
+
+---
+
+## 9. Current Implementation Status
+
+**Real and working today:**
+- FastAPI backend with the full pipeline above, 22 passing backend tests
+  (`pytest backend/tests`, spanning unit tests for the decision engine,
+  policy engine, and executor, plus integration tests for the API and
+  full pipeline).
+- A trained XGBoost model (`RecoveryModel`) actually producing
+  `model_recovery_prob` per transaction — not a stub.
+- The deterministic policy engine actually blocking/downgrading/rerouting
+  proposed actions — every "blocked" or "escalated" state in the UI comes
+  from real `evaluate_policy()` output.
+- Full Next.js dashboard with every route in §4 implemented and wired to
+  real API data.
+- Idempotency-key support on intervention execution.
+- Structured audit logging queryable via `/api/audit`.
+
+**Simulated, not real, today:**
+- **Execution provider**: `SimulationProvider`
+  (`backend/app/integrations/simulation.py`) is the only
+  `PaymentExecutionProvider` implementation. It does not call Razorpay or
+  any real payment API — it draws a random outcome weighted by the
+  action's real scored probability (`random.random() < prob`). Never
+  describe an executed intervention in UI copy as a real payment
+  operation; "REVORA attempts the payment again" (etc.) is accurate
+  product language, "Razorpay processed this payment" is not.
+- **AI Copilot**: `recovery_service.copilot_query()` is deterministic
+  string-matching and f-string templating over real pipeline data (query
+  keyword detection → canned response shape filled with real numbers) —
+  there is **no live LLM call** in the current implementation, despite
+  `LLM_PROVIDER`/`ANTHROPIC_API_KEY`/`OPENAI_API_KEY` existing in
+  `.env.example` and being described as a future abstraction in
+  `AGENTS.md` §9. No `backend/app/ai/llm_client.py` or equivalent exists
+  yet. Don't claim "Copilot uses Claude/GPT" in product copy — it doesn't,
+  yet.
+- **Persistence**: `InMemoryRepository` only — all state (scanned
+  transactions, decisions, interventions, audit log) resets on backend
+  process restart. No `PostgresRepository` exists yet, despite
+  `DATABASE_URL` being present in `.env.example`. Don't claim persistent
+  storage in product copy.
+- **Auth**: none. Single-tenant demo mode.
+
+---
+
+## 10. Page-Specific Design Identity
+
+Each major page has its own visual identity — established deliberately so
+the product doesn't read as one template stamped six times. Do not copy
+one page's signature visual onto another.
+
+| Page | Identity | Signature visual |
+|---|---|---|
+| **Revenue Command** (`/mission-control`) | System overview / money flow | A central REVORA node with revenue streams flowing in and recovery paths flowing out (`components/flow/RevenueFlowSystem.tsx`) |
+| **Revenue Scanner** (`/revenue-scanner`) | Revenue discovery / X-ray | A field of transaction dots swept by a scan line that reveals leak categories (`components/scanner/TransactionField.tsx`) |
+| **Recovery Brain** (`/recovery-brain`) | Decision intelligence | A "Decision Field": five lanes (one per recovery action) with transactions plotted by real confidence/value, a dormant→scanning→resolved state machine, and a Decision Detail panel (`components/recovery-brain/DecisionField.tsx` + `DecisionDetail.tsx`) |
+| **Transactions** (`/transactions`) | Forensic revenue ledger | A dense investigation table with a per-row risk signal rail, feeding a "Revenue Case" investigation drawer with a live signal path (Event → Leak → Signals → Recovery) (`components/transactions/TransactionLedger.tsx`, `SignalPath.tsx`, `components/drawer/TransactionDrawer.tsx`) |
+| **Interventions** (`/interventions`) | Operational action control | A real pipeline funnel (Decided → Ready → Executing → Completed) plus a three-lane action stream, feeding an "Action Control Center" drawer with Overview/Timeline/Transaction/Technical tabs (`components/interventions/ActionStream.tsx`, `InterventionDetail.tsx`) |
+
+The shared icon mapping (`Sidebar.tsx`), one per destination: Revenue
+Command = `LayoutDashboard`, Revenue Scanner = `ScanLine`, Recovery Brain
+= `Network`, Transactions = `Rows3`, Interventions = `Crosshair`, Recovery
+Controls = `SlidersHorizontal`, Escalations = `CircleAlert`, Audit Trail =
+`History`, Analytics = `TrendingUp`, Integrations = `Waypoints`, Settings
+= `Settings`, AI Copilot = `Sparkles`.
+
+Any future page should be given its own distinct signature visual and
+plain-language identity line, while staying within the shared visual
+system in §5.
+
+---
+
+## 11. Frontend Development Rules
+
+- Inspect the existing implementation of a page/feature before changing
+  it. Read the current `page.tsx` and every component it imports first.
+- Reuse existing components, hooks, and API client methods
+  (`frontend/lib/api.ts`) where appropriate — don't duplicate a fetch call
+  or a derivation function that already exists (e.g. action-label/status
+  helpers live in `frontend/lib/actionMeta.ts` and are shared by both
+  Transactions and Interventions; extend that file rather than
+  re-implementing per page).
+- Work only on the requested page/feature. Do not modify unrelated pages
+  "while you're in there," and do not touch the backend during a
+  frontend/design task unless explicitly asked.
+- Preserve working functionality — a visual pass must not remove a filter,
+  break a keyboard shortcut, or change what an API call does.
+- The dashboard shell (`frontend/app/(dashboard)/layout.tsx`, `Header.tsx`,
+  `Sidebar.tsx`) is shared chrome — changing it affects every page; treat
+  it as higher-risk than a single-page change.
+- `TransactionDrawer.tsx` is shared between the Transactions page and
+  Revenue Command (`mission-control/page.tsx` also opens it) — a change
+  there affects both entry points.
+
+---
+
+## 12. Visual Preview Workflow
+
+Every visual/design change on this project is treated as a **preview**,
+not a finished change, until the user explicitly says otherwise.
+
+**Before editing anything:**
+1. Identify every file about to be modified.
+2. Create `frontend/_backups/<feature>-preview-<YYYYMMDD>/` (append `-v2`,
+   `-v3`, ... if a same-day round already used that name — never overwrite
+   an existing backup).
+3. Copy every file about to be modified into that directory, preserving
+   its original relative path.
+4. Create a `RESTORE.md` inside it with an explicit
+   `backup path → original path` table, plus a short note on what the
+   round changed and why (this has proven useful for later rounds that
+   build on top of an earlier preview).
+
+**After implementation:**
+- Run `npm run build` in `frontend/` and fix all TypeScript/build errors.
+- Actually browser-test the affected route (a temporary
+  `npm install --no-save playwright@1.63.0`, verified end-to-end, then
+  `npm uninstall --no-save playwright` when done, has been the working
+  pattern all session — `npm run build` alone has repeatedly missed real
+  bugs that only showed up in the browser).
+- Test responsive layouts, at minimum 1440px, 1024px, and ~390px.
+- Check the browser console for new errors — zero new errors is the bar;
+  pre-existing unrelated errors should be reported, not silently fixed
+  (see §17).
+- **Restart the dev server after every `npm run build`.** Running a
+  production build while a `next dev` server is still up from an earlier
+  round corrupts its `.next` chunk cache and produces confusing 404s that
+  look like a real bug but aren't — kill and restart `next dev` before
+  re-testing.
+- Verify real API behavior where relevant (e.g. actually execute an
+  intervention against the running backend rather than assuming the UI
+  is correct from static inspection).
+
+**Then stop and wait for explicit review.** The two expected responses:
+- **FINALIZE** — keep the preview. (Committing/pushing after this is a
+  separate, explicit step — see §13. Finalizing a preview does not by
+  itself commit anything.)
+- **NAHH — RESTORE** — restore every file listed in that round's
+  `RESTORE.md` back to its backed-up content, then re-verify the build.
+
+Never automatically finalize a visual preview, and never skip the backup
+step because a change "looks small."
+
+---
+
+## 13. Git Rules
+
+- Never automatically `git commit` or `git push` during design/preview
+  work.
+- Only commit/push after an explicit **FINALIZE** instruction, and even
+  then, only what was actually reviewed and approved — inspect
+  `git status` and the staged diff before committing; don't blindly
+  `git add -A` if unrelated changes exist in the working tree.
+- Commits must use the repository owner's real identity (currently
+  `tushar-cr7`, configured in local git config) — never an AI-authored
+  identity as the commit `Author`. (A `Co-Authored-By:` trailer for the
+  assisting model, when the session's own instructions specify one, is
+  fine and is not the same thing as the commit author.)
+- Keep commits focused and professional — a clear, single-purpose message,
+  not a dump of internal reasoning.
+- Never force-push, never rewrite already-pushed history, without
+  explicit instruction.
+
+---
+
+## 14. Quality Bar
+
+REVORA should feel like a serious production fintech/revenue
+infrastructure product — not a hackathon dashboard, not a generic admin
+panel. For every UI change, ask:
+
+- Does this have a clear product purpose?
+- Does it communicate business meaning immediately, without the user
+  having to think about how it works?
+- Does it feel premium and intentional — composition and hierarchy doing
+  the work, not decoration?
+- Is the information hierarchy strong (amount/status before IDs, action
+  before implementation detail)?
+- Is motion meaningful (communicates a real state change) rather than
+  decorative?
+- Does it preserve existing functionality?
+- Does it use real data, with honest empty/loading/error states where
+  data isn't available?
+- Does it avoid making this page look like a reskin of another page (see
+  §10)?
+
+If the honest answer to any of these is "no," keep refining before
+reporting the work as done.
+
+---
+
+## 15. Performance / Claude Workflow
+
+**This repository is the source of truth, not the conversation history.**
+A prior session's context should never need to be replayed into a new one
+to continue working here.
+
+For every new Claude session on this project:
+- Read this file first.
+- Inspect only the repository files relevant to the specific task — the
+  route's `page.tsx`, the components it imports, and (for backend
+  questions) the specific service/domain file — rather than reading the
+  whole tree.
+- Work on one major page/feature at a time. Don't fan a single request
+  out into a multi-page redesign unless explicitly asked.
+- Don't ask the user to re-explain project history that's already
+  captured here; use the codebase itself (current implementation, recent
+  `frontend/_backups/*/RESTORE.md` files) to understand what was done
+  recently and why.
+- Keep responses and internal reasoning scoped to the current task —
+  avoid re-deriving or restating this entire file's content back to the
+  user unless asked.
+
+The goal is deliberately small, focused Claude sessions instead of one
+large accumulated one.
+
+---
+
+## 16. Current Completed Work
+
+Significant frontend work completed and currently in the repository
+(all under the preview workflow in §12 — check `frontend/_backups/` for
+the paired backup/RESTORE.md of each round):
+
+- **Iconography system** — a single coherent icon per nav destination
+  (Lucide, restrained, consistent stroke weight), replacing an earlier ad
+  hoc icon set. Defined in `Sidebar.tsx`, reused in each page's header.
+- **Revenue Command** — the money-flow hero visualization
+  (`RevenueFlowSystem.tsx`) went through several iterations to its current
+  form.
+- **Revenue Scanner** — the transaction-field X-ray visualization
+  (`TransactionField.tsx`) with a deterministic seeded dot field and
+  scan-line sweep.
+- **Recovery Brain** — rebuilt around a "Decision Field" (five lanes, one
+  per recovery action, transactions plotted by real confidence/value)
+  with idle/scanning/results states and a Decision Detail panel.
+- **Transactions** — rebuilt into a forensic ledger (dense table, risk
+  signal rail per row, real derived filters) feeding a "Revenue Case"
+  drawer (case header, signal path, evidence, REVORA's recommendation,
+  safety check against live policy limits, timeline, transaction detail,
+  technical detail).
+- **Interventions** — rebuilt into an operational "Action Control"
+  surface:
+  - A real pipeline funnel: **Decided → Ready → Executing → Completed**,
+    every count derived from `/api/opportunities` +
+    `/api/interventions` (no persisted "in progress" state exists server
+    side — see §16 note below).
+  - A KPI rail (Revenue at Risk, Actions Today, In Progress, Completed,
+    Blocked, Needs Attention), each with a real one-line caption instead
+    of a fabricated trend percentage.
+  - A unified intervention ledger (queued + completed rows in one table,
+    status-differentiated, real per-action/status filter counts).
+  - An "Action Control Center" detail drawer with **Overview / Timeline /
+    Transaction / Technical** tabs, a real confirm-then-execute flow, and
+    honest handling of the blocked-action case ("REVORA prevented this
+    action" + the real policy reason + a "Review Case" CTA that runs the
+    real safe alternative).
+  - A real execution flow: confirm → call `POST /interventions/{id}/execute`
+    → render the actual returned outcome (recovered / not recovered /
+    suppressed / escalated) — never a simulated/faked success.
+  - Verified responsive down to 390px, including a bottom-sheet variant
+    of the detail drawer on narrow viewports.
+
+---
+
+## 17. Known Issues / Limitations
+
+- **Revenue Command console warning**: `RevenueFlowSystem.tsx` (the money
+  flow hero on `/mission-control`) logs
+  `Error: <circle> attribute r: Expected length, "undefined"` in the
+  browser console — a handful of `motion.circle` elements animate `r`
+  without a matching `initial` value. Confirmed pre-existing across
+  multiple verification rounds this project; explicitly out of scope for
+  every subsequent page-specific task, so it has been left as-is each
+  time. Fix is small (add matching `initial` values) but has never been
+  in scope for the task that found it.
+- **No persisted "in progress" intervention state.** The backend only
+  ever returns already-completed interventions — there is no queued/
+  executing record server-side. The frontend's "Executing" state is a
+  purely client-side transient (see §16); any future backend work that
+  adds real async/queued execution should update
+  `frontend/components/interventions/interventionSignals.ts` accordingly.
+- **`/api/opportunities` includes already-executed transactions.** See
+  §7 — the frontend, not the backend, is responsible for deriving the
+  real "not yet executed" queue.
+- **A transaction can have multiple `Intervention` records.** See §7 —
+  always dedupe to the latest by timestamp before displaying or summing.
+- **AI Copilot is not LLM-backed.** See §9 — don't extend it assuming an
+  LLM call exists; it's template/string logic today.
+- **In-memory-only backend state.** A backend restart clears all scanned
+  transactions, decisions, interventions, and audit history. This is
+  expected in the current demo build, not a bug — but it means "current
+  data looks empty" after a backend restart is normal and just needs
+  `POST /scan` then `POST /analyze` to repopulate before testing a data
+  dependent page.
+- **`UI_DESIGN.md` §8 predates the mobile work** in §16 above and claims
+  "below 768px: not a target for this hackathon." That's stale — several
+  pages (Transactions, Interventions, Recovery Brain) now have verified,
+  working layouts down to 390px. Don't use that line as a reason to skip
+  mobile verification on a page that's already been rebuilt.
+
+---
+
+## 18. Important Files / Directories
+
+Start here, not with a full repository scan:
+
+**Backend entry points**
+- `backend/app/main.py` — app wiring, CORS, startup
+- `backend/app/api/routes.py` — every endpoint, one file
+- `backend/app/domain/policy.py` — the policy engine (read before
+  discussing any "blocked"/"safety" behavior)
+- `backend/app/intelligence/decision_engine.py` — expected-value scoring
+- `backend/app/services/recovery_service.py` — orchestrates the whole
+  pipeline; also where Copilot's response text is actually built
+
+**Frontend entry points**
+- `frontend/app/(dashboard)/layout.tsx` — shared dashboard shell
+- `frontend/components/layout/Sidebar.tsx` — nav structure + icon map,
+  source of truth for page identity/ordering
+- `frontend/lib/api.ts` — the entire typed API client; add new backend
+  calls here, don't `fetch()` ad hoc in a component
+- `frontend/lib/types.ts` — frontend mirror of backend response shapes
+- `frontend/lib/actionMeta.ts` — shared action-label/safety-check/
+  rationale helpers used by both Transactions and Interventions
+- `frontend/tailwind.config.ts` — every design token (colors, radii,
+  shadows)
+- `frontend/components/brand/RevoraLogo.tsx` — the logo component
+
+**Per-page component directories** (each page's feature-specific
+components live in a matching folder under `frontend/components/`):
+`flow/` (Revenue Command), `scanner/` (Revenue Scanner),
+`recovery-brain/` (Recovery Brain), `transactions/` + `drawer/`
+(Transactions), `interventions/` (Interventions).
+
+**Reference docs** (repo root): `README.md` (product summary),
+`AGENTS.md` (binding architectural/workflow rules — read before touching
+the backend), `PROJECT_STRUCTURE.md` (layer boundaries), `UI_DESIGN.md`
+(full design-token spec and explicit ban list — mostly still accurate,
+see the one stale note in §17 above).
+
+**Rollback history**: `frontend/_backups/*/RESTORE.md` — every completed
+preview round's exact before/after file mapping. Check here before
+assuming what a page used to look like.
