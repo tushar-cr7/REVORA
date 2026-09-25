@@ -1,0 +1,7 @@
+{
+    "status":  "notified",
+    "project":  "REVORA",
+    "summary":  "Rebuilt /analytics into its own \u0027Revenue Outcome Intelligence\u0027 surface: a segmented revenue-composition bar as the signature visual, Recovery by Action and Recovery by Leak Type breakdowns, and a What\u0027s working / Where attention remains insights panel. All figures are real or transparently derived from /api/analytics, /api/interventions, /api/opportunities, and /api/transactions (recovered revenue is deduplicated by transaction for correctness). No backend, Interventions, or other page files were touched. Build clean, zero new console errors, verified at 1440/1024/390px. User reviewed and finalized this round.",
+    "completed_at":  "2026-09-22T03:51:45Z",
+    "requires_git_review":  true
+}

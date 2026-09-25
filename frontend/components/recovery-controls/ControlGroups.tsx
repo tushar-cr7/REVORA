@@ -12,13 +12,23 @@ interface ControlRow {
   value: string;
 }
 
+type GroupTone = 'primary' | 'warning' | 'success';
+
 interface ControlGroup {
   key: string;
   title: string;
   description: string;
   icon: React.ElementType;
+  tone: GroupTone;
+  headline?: string;
   rows: ControlRow[];
 }
+
+const TONE_BADGE: Record<GroupTone, string> = {
+  primary: 'text-primary-300 border-primary-500/30 bg-primary-muted/40',
+  warning: 'text-warning-300 border-warning-500/30 bg-warning-muted/40',
+  success: 'text-success-300 border-success-500/30 bg-success-muted/40',
+};
 
 function buildGroups(policy: PolicyLimits): ControlGroup[] {
   return [
@@ -27,6 +37,7 @@ function buildGroups(policy: PolicyLimits): ControlGroup[] {
       title: 'Action Limits',
       description: 'How often and how far REVORA can act on one case.',
       icon: RotateCw,
+      tone: 'primary',
       rows: [
         {
           key: 'max_retries',
@@ -47,6 +58,7 @@ function buildGroups(policy: PolicyLimits): ControlGroup[] {
       title: 'Customer Contact',
       description: 'How often a customer can be reached about a recovery case.',
       icon: MessageCircle,
+      tone: 'primary',
       rows: [
         {
           key: 'max_customer_contacts_per_day',
@@ -61,6 +73,7 @@ function buildGroups(policy: PolicyLimits): ControlGroup[] {
       title: 'Escalation',
       description: 'When a case is handed back to you instead of retried automatically.',
       icon: CircleAlert,
+      tone: 'warning',
       rows: [
         {
           key: 'max_subscription_consecutive_failures_for_retry',
@@ -81,11 +94,13 @@ function buildGroups(policy: PolicyLimits): ControlGroup[] {
       title: 'Risk Boundaries',
       description: 'Financial ceiling that prevents excessive autonomous action.',
       icon: Gauge,
+      tone: 'success',
+      headline: formatINR(policy.max_auto_recovery_value),
       rows: [
         {
           key: 'max_auto_recovery_value',
           label: 'Autonomous recovery ceiling',
-          sentence: `Up to ${formatINR(policy.max_auto_recovery_value)} per recovery action — above this, REVORA escalates instead.`,
+          sentence: `Up to ${formatINR(policy.max_auto_recovery_value)} per recovery action. Above this, REVORA escalates instead.`,
           value: formatINR(policy.max_auto_recovery_value),
         },
       ],
@@ -128,9 +143,18 @@ export function ControlGroups({ policy, loading, error }: ControlGroupsProps) {
         const Icon = group.icon;
         return (
           <div key={group.key} className="bg-panel border border-border-strong rounded-xl p-5 shadow-sm flex flex-col min-w-0">
-            <div className="flex items-center gap-2 pb-3 mb-3 border-b border-border-subtle">
-              <Icon className="w-4 h-4 text-primary-400 shrink-0" />
-              <span className="text-[11px] font-semibold uppercase tracking-wider text-text-secondary">{group.title}</span>
+            <div className="flex items-start justify-between gap-2 pb-3 mb-3 border-b border-border-subtle flex-wrap">
+              <div className="flex items-center gap-2.5 min-w-0">
+                <span className={`w-7 h-7 rounded-full border flex items-center justify-center shrink-0 ${TONE_BADGE[group.tone]}`}>
+                  <Icon className="w-3.5 h-3.5" strokeWidth={1.75} />
+                </span>
+                <span className="text-[11px] font-semibold uppercase tracking-wider text-text-secondary leading-snug">{group.title}</span>
+              </div>
+              {group.headline && (
+                <span className="text-[11px] font-mono font-semibold text-success-300 bg-success-muted/40 border border-success-500/25 rounded px-2 py-0.5 shrink-0 whitespace-nowrap">
+                  {group.headline}
+                </span>
+              )}
             </div>
             <p className="text-[11.5px] text-text-muted mb-4 leading-relaxed">{group.description}</p>
 

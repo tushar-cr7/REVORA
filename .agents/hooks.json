@@ -1,0 +1,11 @@
+{
+  "handoff-check": {
+    "PreInvocation": [
+      {
+        "type": "command",
+        "command": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File ./check_handoff.ps1",
+        "timeout": 10
+      }
+    ]
+  }
+}

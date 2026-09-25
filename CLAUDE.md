@@ -645,3 +645,35 @@ see the one stale note in §17 above).
 **Rollback history**: `frontend/_backups/*/RESTORE.md` — every completed
 preview round's exact before/after file mapping. Check here before
 assuming what a page used to look like.
+
+---
+
+## 19. Git & Handoff Automation
+
+**ABSOLUTE RULE: Claude Code NEVER performs Git or GitHub operations.**
+
+Claude must NEVER:
+- `git add`, `git commit`, `git push`, `git pull`, `git reset`, `git rebase`
+- `git checkout` for Git-history purposes
+- force push, modify Git history, or configure Git identity
+- create GitHub releases
+- create commits through any IDE Git integration
+
+Git operations belong exclusively to Antigravity/Gemini and Tushar.
+
+**When a major development chunk is complete and verified:**
+Do NOT commit your changes. Instead, create or update the local Git handoff marker at `.revora/git-handoff.json` with the following structure:
+
+```json
+{
+  "status": "ready",
+  "project": "REVORA",
+  "summary": "Describe the milestone you completed here.",
+  "completed_at": "YYYY-MM-DDTHH:mm:ssZ",
+  "requires_git_review": true
+}
+```
+
+A "major chunk" means completing a major page, feature, substantial refactor, meaningful backend capability, complete UI section, or verified product milestone. Do NOT trigger this for typo fixes, one-line fixes, formatting, dependency noise, temporary experiments, minor CSS adjustments, or unfinished work.
+
+Updating this file will signal Antigravity to review your changes and ask Tushar for commit approval.
