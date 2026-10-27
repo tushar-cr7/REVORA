@@ -394,9 +394,9 @@ resolves ids against the *active* run; `/interventions`, `/analytics` and
 ## 9. Current Implementation Status
 
 **Real and working today:**
-- FastAPI backend with the full pipeline above, 462 backend tests passing
-  (`REVORA_REQUIRE_POSTGRES=1 pytest backend/tests`, last run 2026-10-23 on
-  PostgreSQL 18.6 / Windows: 462 passed, 0 skipped). A green suite shows the
+- FastAPI backend with the full pipeline above, 470 backend tests passing
+  (`REVORA_REQUIRE_POSTGRES=1 pytest backend/tests`, last run 2026-10-27 on
+  PostgreSQL 18.6 / Windows: 470 passed, 0 failed). A green suite shows the
   implemented behaviour and safeguards work as tested; it is **not** evidence of
   production readiness (see §9 "Simulated, not real" and §17). The suite covers: unit tests for the decision engine, policy engine,
   strict/fail-closed policy gate, case state machine, executor, storage

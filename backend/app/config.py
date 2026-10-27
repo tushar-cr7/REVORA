@@ -37,8 +37,8 @@ class ConfigurationError(RuntimeError):
 STORAGE_POSTGRES = "postgres"
 STORAGE_MEMORY = "memory"
 
-# The sample value shipped in .env.example. Running against it is always a mistake.
-_PLACEHOLDER_CREDENTIALS = "user:password@"
+# Sample credentials shipped in .env.example / the docs. Running against them is always a mistake.
+_PLACEHOLDER_CREDENTIALS = ("user:password@", ":change_me@")
 
 _TRUE = {"1", "true", "yes", "on"}
 _FALSE = {"", "0", "false", "no", "off"}
@@ -124,9 +124,10 @@ def load_storage_config(env: Optional[Mapping[str, str]] = None) -> StorageConfi
         )
     if not url.startswith(("postgresql://", "postgres://")):
         raise ConfigurationError("DATABASE_URL must start with postgresql:// (a libpq connection URI).")
-    if _PLACEHOLDER_CREDENTIALS in url:
+    if any(marker in url.lower() for marker in _PLACEHOLDER_CREDENTIALS):
         raise ConfigurationError(
-            "DATABASE_URL still has the placeholder credentials from .env.example (user:password). Set the real ones."
+            "DATABASE_URL still has the placeholder credentials from .env.example (CHANGE_ME / user:password). "
+            "Set the real ones."
         )
     schema = (env.get("REVORA_DB_SCHEMA") or "").strip() or None
     if schema is not None:

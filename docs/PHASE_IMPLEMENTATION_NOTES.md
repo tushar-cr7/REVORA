@@ -161,7 +161,7 @@ Instead of tracking retry counters on mutable transaction objects, REVORA introd
 
 ## 4. Phase 2 Deep Dive: Durable Foundation & Event Ingestion
 
-*Implemented in Backend | Backed up 2026-10-22 | Test count: 462 tests (verified passing 2026-10-23 against PostgreSQL 18.6)*
+*Implemented in Backend | Backed up 2026-10-22 | Test count: 470 tests (verified passing 2026-10-27 against PostgreSQL 18.6)*
 
 > **Status:** functionally complete and verified by the test suite, mutation checks and an HTTP-level restart smoke test (see `docs/PHASE_2_CHECKPOINT.md`). **Not production-ready:** no authentication or tenancy, simulated execution provider only, no real merchant data or provider adapter, audit log not tamper-evident, no backup/HA story, tested on PostgreSQL 18.6 / Windows only, and the UI has not been exercised in a browser against PostgreSQL. A passing suite is not a production-readiness claim.
 
@@ -233,7 +233,7 @@ In distributed systems, webhooks and events arrive out of order or duplicated.
 | **Idempotency** | Global string dictionary | **Merchant-scoped + SHA-256 fingerprint** | **Durable DB unique constraints** | Distributed Redis/DB idempotency |
 | **Data Ingestion** | Synthetic batch generator only | Scoped `ScanRun`s (fingerprinted & reusable) | **Normalized Live Event Ingestion** (`/api/ingest/events`) | Webhook adapters (Stripe, Razorpay, Recurly) |
 | **Provider** | Simulated | `SimulationProvider` | `SimulationProvider` | **Live Razorpay / Payment Gateway API** |
-| **Test Suite** | 21 tests | 172 tests | **462 tests (incl. multi-pool concurrency)** | Comprehensive E2E integration suite |
+| **Test Suite** | 21 tests | 172 tests | **470 tests (incl. multi-pool concurrency)** | Comprehensive E2E integration suite |
 
 ---
 

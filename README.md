@@ -109,6 +109,12 @@ python -m backend.app.db.migrate upgrade        # create / update the schema
 python -m uvicorn backend.app.main:app --port 8000
 ```
 
+Instead of exporting variables you can copy `.env.example` to `.env` (gitignored) and edit it; the backend loads the
+repo-root `.env` and real environment variables win over it. On Windows, `run.bat` starts both servers, but first
+runs `python -m backend.app.preflight`, which checks the storage settings (without connecting to the database) and,
+if they are missing or still the sample values, prints what to fix and starts nothing. A reachable database and a
+migrated schema are still checked by the backend itself at startup.
+
 ### Run Tests
 ```bash
 pytest backend/tests -v          # database tests start a throwaway PostgreSQL if one is installed locally
