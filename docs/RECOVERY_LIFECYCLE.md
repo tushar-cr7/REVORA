@@ -1,0 +1,235 @@
+# Recovery lifecycle, attempt ledger & execution safety (Phase 1)
+
+> **Status:** the Phase 1 design, now running on either repository. Over the in-memory repository it is
+> volatile and single-process; over PostgreSQL (Phase 2 — see `docs/DURABLE_FOUNDATION.md`) the same rules
+> are enforced by database transactions, row locks and constraints and survive restarts. Either way it is
+> not authenticated and it executes nothing real. Do not read anything here as a production-readiness claim.
+> Where this document says "critical section" or `atomic()`, read the Phase 2 document for what that means on
+> a database (units of work, committed refusals, interrupted-reservation recovery).
+
+**AI recommends. Deterministic policy authorizes. The execution layer enforces
+that authorization against current state.**
+
+## 1. Flow
+
+```
+POST /scan ──► SCAN RUN (identity) ──► transactions + one RecoveryCase each (state: open)
+POST /analyze ─► model score ─► decision engine ─► strict policy ─► case: authorized | blocked
+POST /interventions/{id}/execute  (also used, per case, by POST /recover)
+   resolve case in the ACTIVE run
+   idempotency check (merchant, operation, key) + request fingerprint
+   state guard (executing / terminal / no decision are refused)
+   current facts from the attempt ledger  ──► policy re-evaluation (strict)
+        denied ─► DENIED attempt + ACTION_BLOCKED audit, 409, provider never called
+        allowed ─► RESERVE attempt (case → executing)       ← one critical section
+   provider call                                            ← OUTSIDE the critical section
+   complete: attempt, case state, intervention, idempotency record, audit
+```
+
+Code: `backend/app/services/execution_service.py` (the only execution pathway),
+`backend/app/services/recovery_service.py` (scan / analyze / bulk / analytics),
+`backend/app/domain/models.py` (entities + state machine),
+`backend/app/domain/policy.py` (`evaluate_policy`, `evaluate_policy_strict`),
+`backend/app/repositories/` (`atomic()`, run-scoped storage).
+
+## 2. Recovery case state machine
+
+| State | Meaning |
+|---|---|
+| `open` | scanned, no decision yet |
+| `authorized` | a decision exists and policy allowed the proposed action |
+| `blocked` | policy refused the proposal, at decision time or at execution time. Executable as the policy-sanctioned alternative (`escalate` / `suppress`); after an execution-time denial the original action is re-checked on every request and runs again only once the blocking condition has cleared (e.g. cooldown elapsed) |
+| `executing` | an attempt is reserved and in flight |
+| `recovered` | a simulated attempt recovered the amount — **terminal** |
+| `attempted_no_recovery` | an attempt ran (or failed) without recovering; may be tried again if policy allows |
+| `suppressed` | deliberate no-action executed — **terminal** |
+| `escalated` | handed to the merchant — **terminal, and not a recovery** |
+
+Valid transitions (`CASE_TRANSITIONS` in `models.py` — anything else raises):
+
+```
+open                   → authorized | blocked
+authorized             → executing  | blocked      (attempt reserved | execution-time denial / re-analysis)
+blocked                → executing  | authorized   (safe alternative reserved | re-analysis)
+executing              → recovered | attempted_no_recovery | suppressed | escalated
+attempted_no_recovery  → executing  | authorized | blocked
+recovered, suppressed, escalated → (none: terminal)
+```
+
+`RecoveryCase.transition()` is the only way state changes; any move outside
+`CASE_TRANSITIONS` raises `InvalidCaseTransition`. A denial moves
+`authorized`/`attempted_no_recovery` → `blocked`. Re-analysis may move
+`blocked`/`attempted_no_recovery` → `authorized`/`blocked` with a fresh decision;
+cases that are `executing` or terminal keep their decision.
+
+## 3. Attempt ledger (`ExecutionAttempt`)
+
+One entry per execution request that reached authorization — source of truth for
+retry counts, contact counts, cooldown and analytics.
+
+`attempt_id`, `case_id`, `run_id`, `merchant_id`, `transaction_id`, `customer_id`,
+`sequence` (all entries, denials included), `attempt_number` (counted attempts
+only; `null` for a denial), `requested_action` (the case's authorized action),
+`final_action` (what was authorized to run; `null` if denied), `decision_id`,
+`authorization` (`allowed`, `reason`, `final_action`, `policy_version`,
+`evaluated_at`, `limits` snapshot, `inputs` the verdict was computed from),
+`status`, `idempotency_key`, `request_fingerprint`, `provider`, `execution_mode`,
+`created_at`, `completed_at`, `intervention_id`, `outcome_status`, `recovered`,
+`recovered_amount`, `failure_reason`.
+
+| `status` | Meaning | Counts toward retry / contact limits |
+|---|---|---|
+| `reserved` | authorized and recorded, provider has not returned | yes |
+| `completed` | provider returned a valid result (recovered or not) | yes |
+| `failed` | provider raised, or returned an unusable/contradictory result | yes (it may have acted) |
+| `denied` | policy refused at execution; never reached the provider | no |
+
+A **replay** (same idempotency key, same request) is not an attempt: it returns the
+stored result and writes nothing. Read it with `GET /api/cases/{case_id}`.
+
+## 4. Execution-time policy
+
+Policy is re-evaluated inside the reservation critical section from **current**
+facts, never from the stored decision alone:
+
+- `retries_so_far` = ingested baseline + counted `retry` attempts on the case
+- `contacts_today` = counted `reminder` / `payment_link` attempts against the same
+  merchant + customer in the trailing 24 h, **across runs**
+- `hours_since_last_attempt` = hours since this case's latest counted retry
+- limits come from `RecoveryService.policy` (the same object `/api/policies` reports)
+
+`evaluate_policy_strict` (policy.py) is `evaluate_policy` plus a **fail-closed**
+input check: a missing/NaN/negative/non-numeric input that the rules for that action
+depend on denies and reroutes to `escalate`. Ingestion no longer turns a missing
+`retries_so_far` / `hours_since_event` / subscription `consecutive_failures` / invoice
+`age_days` into `0`.
+
+Scope of the gate: `retry`, `payment_link`, `reminder` (the actions with an
+external effect) are always strictly evaluated. `escalate` and `suppress` move no
+money and contact no one; they are the policy-sanctioned safe sinks and are always
+executable (otherwise a case the decision layer rerouted *to* them could be
+stranded — e.g. a ₹40k item suppressed by the cooldown rule, which outranks the
+ceiling rule).
+
+Rule-order change: the subscription-failure rule now runs before the cooldown rules
+(it still runs after the retry cap). Previously a recent last event made the weaker
+cooldown rule (`suppress`) pre-empt it. On the synthetic data it stays unreachable
+because the generator sets `retries_so_far = consecutive_failures − 1`, so the
+retry-cap rule already fires at the same point; the change only matters for data
+where the two diverge.
+
+New policy input: `hours_since_last_attempt` — retry cooldown measured from REVORA's
+own previous retry (the existing rule measures from the original event).
+
+## 5. Idempotency
+
+Scope `(merchant_id, operation, key)`, bound to a request fingerprint
+(`sha256` of operation, merchant, **resolved case id**, `expected_action`).
+A transaction id, its leak id, and the case id are the same target.
+
+| Situation | Result |
+|---|---|
+| same key, same request, finished | original result, header `Idempotent-Replayed: true`, no side effects, no audit event |
+| same key, different transaction / action | `422 idempotency_key_reuse` |
+| same key, original still in flight | `409 request_in_progress` |
+| new key, case executing | `409 case_not_executable` |
+| new key, case terminal (recovered / escalated / suppressed) | `409 case_not_executable` — no second recovery |
+| new key, case `attempted_no_recovery` | a **new attempt**, if strict policy authorizes it now |
+| policy denial | `409 policy_denied` (stored; a replay returns the same denial, no new record or event) |
+| provider failure | `502 provider_failure` (stored the same way) |
+
+Optional request body `{"expected_action": "retry"}` executes only if that is the
+case's currently authorized action (`409 action_mismatch` otherwise). Requests
+without a key are still protected by the case-state guard, but cannot be told apart
+from a deliberate new attempt — send a key.
+
+A stored denial or failure is replayed for the same key even after the blocking condition clears — use a new key to try again.
+
+Errors are `{"detail": "<string>", "code": "...", ...context}`; `detail` stays a
+plain string because the dashboard's fetch wrapper surfaces it verbatim.
+
+## 6. Scan runs
+
+A scan creates or re-activates a **run** (`run_id`) keyed by the source
+fingerprint `(merchant_id, n_total, seed)` — the generator is deterministic, so
+equal fingerprints mean equal data.
+
+- Identical source data → the existing run is **re-activated with all its state**
+  (`reused_existing_run: true`). The dashboard re-scans on page loads; this no longer
+  resets anything or reopens executed cases.
+- New source data → new run; the previous one becomes `superseded`, never deleted.
+- Every transaction, case, decision, attempt, intervention and audit event carries its
+  `run_id`. The same `transaction_id` in two runs is two different records with two
+  cases; nothing crosses over.
+- Reads default to the **active** run: `/transactions`, `/opportunities`,
+  `/decisions/{id}` (by tx/leak id), `/interventions`, `/escalations`, `/analytics`,
+  `/audit`. `?run_id=<id>` or `?run_id=all` reaches history on `/interventions`,
+  `/audit`, `/cases`. A case id from a superseded run is readable but not executable
+  (`409 run_superseded`).
+- `GET /api/runs` lists runs.
+
+## 7. Bulk recovery (`POST /recover`)
+
+Calls `ExecutionService.execute` per case — no separate logic. Eligible = state
+`authorized`/`blocked`, never attempted, has a decision. Everything else is skipped
+(including `attempted_no_recovery`: a failed case is never auto-retried in bulk). The
+per-case key is `bulk:{case_id}:{decision_id}`, so repeating the call replays stored
+denials instead of writing new ones. Calling it twice executes nothing the second time.
+
+Response: the existing totals are now **cumulative for the active run** (unique
+outcomes from the ledger); additive `*_now` fields (`executed_now`, `recovered_now`,
+`not_recovered_now`, `suppressed_now`, `escalated_now`, `failed_now`, `blocked_now`,
+`skipped_now`) describe only this call. `policy_violations` is computed: the number of
+attempts that ran without an allowed execution-time authorization for the action they
+ran (expected 0; it is an invariant check, not a count of denials).
+
+## 8. Analytics & audit
+
+- `total_recovered` = sum of `recovered_amount` over `recovered` cases (one per case),
+  scoped to the active run. `attempted_amount` is the amount of cases with a recovery
+  attempt — a different thing from recovered. `execution_mode: "simulation"`.
+- New audit events around execution: `ACTION_AUTHORIZED` → `EXECUTION_STARTED` →
+  outcome (`EXECUTION_SUCCEEDED` / `EXECUTION_FAILED` / `ESCALATION_CREATED` /
+  `SUPPRESSION_CREATED`), or a single `ACTION_BLOCKED` (`outcome.status =
+  "denied_at_execution"`). Events carry `run_id`, `case_id`, `attempt_id`. Analysis no
+  longer re-emits `DECISION_CREATED`/`ACTION_BLOCKED` when nothing changed.
+- The audit log is an in-memory append-only list: ordered and queryable, **not**
+  tamper-evident, **not** durable.
+
+## 9. Known limitations
+
+- **In-memory repository only (when selected).** `atomic()` is a re-entrant lock: it serializes threads of
+  one process, does not roll back, and nothing survives restart. *Resolved for PostgreSQL in Phase 2:*
+  `atomic()` is a transaction with row locks, the reserve-then-complete split is kept, and the safety
+  invariants are also database constraints.
+- A crash between reservation and completion strands a case in `executing`. *Resolved in Phase 2:* a reservation
+  older than `REVORA_RESERVATION_TIMEOUT_SECONDS` is closed as a failed, still-counted attempt (next request,
+  startup, or `recover_interrupted()`); see `docs/DURABLE_FOUNDATION.md` §6.2.
+- Denied requests with distinct keys each add a `denied` ledger entry (unbounded growth
+  under a hostile or buggy client). Replays do not.
+- Simulation only: `SimulationProvider` draws outcomes from the scored probability.
+  Nothing real is sent. No auth, no tenancy enforcement beyond the `merchant_id` scope
+  on idempotency keys.
+- "Contacts per day" is a trailing 24 h window; the 24 h window and attempt timestamps
+  come from the service clock (injectable for tests).
+- A policy denial leaves the stale decision in place; the rerouted action becomes
+  executable after `POST /analyze` refreshes it (the 409 body says so).
+- Decision-time rule order still lets the cooldown / contact rules (`suppress`)
+  outrank the value ceiling (`escalate`), so a high-value item inside its cooldown is
+  suppressed rather than escalated. Unchanged by Phase 1; flagged for a product
+  decision.
+
+## 10. Phase 2 additions to this lifecycle
+
+* New final case state `resolved_at_source` (the source reported the obligation settled/voided; not a
+  recovery). It is in `CLOSED_CASE_STATES`, not in `TERMINAL_CASE_STATES`, and execution refuses it.
+* `Decision.policy_limits` stores the limits a verdict was reached under.
+* Ids are ≥ 64 bits (`new_id`), because a primary-key collision is a hard failure on a database.
+* `RecoveryCase.version` (storage bookkeeping, not in the API) guards against stale overwrites.
+
+## 11. Tests
+
+`backend/tests/unit/test_policy_strict.py`, `test_case_lifecycle.py`;
+`backend/tests/integration/test_recovery_lifecycle.py`, `test_execution_api.py`;
+fixtures in `backend/tests/support.py` (scripted provider, fixed model, fake clock,
+hand-built transactions — no randomness). Run: `pytest backend/tests -p no:cacheprovider`.

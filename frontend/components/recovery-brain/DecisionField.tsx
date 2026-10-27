@@ -41,7 +41,7 @@ const LaneBands: React.FC<{ labelFontSize: number; compact: boolean }> = ({ labe
       const y = laneY(i);
       return (
         <g key={lane.key}>
-          {i > 0 && <line x1={0} y1={y} x2={VB_W} y2={y} stroke="#182130" strokeWidth={1} />}
+          {i > 0 && <line x1={0} y1={y} x2={VB_W} y2={y} stroke="#1A2028" strokeWidth={1} />}
           <text x={SIDE_MARGIN - 20} y={y + LANE_H / 2 + 3} fontSize={labelFontSize} fontFamily="var(--font-mono, monospace)" letterSpacing={1} fill="#5A6577" textAnchor="start">
             {compact ? lane.label.slice(0, 3).toUpperCase() : lane.label.toUpperCase()}
           </text>
@@ -258,7 +258,7 @@ export const DecisionField: React.FC<DecisionFieldProps> = ({
                 y1={selectedNode.y}
                 x2={g.x}
                 y2={g.y}
-                stroke={g.isChosen ? '#B69AFF' : '#2A3646'}
+                stroke={g.isChosen ? '#B69AFF' : '#343D4A'}
                 strokeWidth={g.isChosen ? 1 : 0.6}
                 strokeDasharray={g.isChosen ? undefined : '2 2'}
                 initial={{ opacity: 0 }}

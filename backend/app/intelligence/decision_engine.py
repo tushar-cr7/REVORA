@@ -5,10 +5,10 @@ For each leak, estimates expected value of each candidate intervention
 (probability * amount - cost - friction) and proposes the best one,
 then passes it to the policy engine.
 """
-from typing import Dict, Any, List, Union
+from typing import Callable, Dict, Any, List, Union
 import uuid
 from backend.app.domain.models import Action, Decision
-from backend.app.domain.policy import PolicyLimits, DEFAULT_POLICY, evaluate_policy
+from backend.app.domain.policy import PolicyLimits, PolicyResult, DEFAULT_POLICY, evaluate_policy
 
 INTERVENTION_COST = {
     Action.RETRY: 5,
@@ -46,6 +46,7 @@ def decide_intervention(
     leak: Union[Dict[str, Any], Any],
     base_recovery_prob: float,
     policy: PolicyLimits = DEFAULT_POLICY,
+    evaluator: Callable[..., PolicyResult] = evaluate_policy,
 ) -> Decision:
     if isinstance(leak, dict):
         leak_data = leak
@@ -80,7 +81,7 @@ def decide_intervention(
     best = scored[0]
     proposed_action = Action(best["action"])
 
-    policy_result = evaluate_policy(leak_data, proposed_action, policy)
+    policy_result = evaluator(leak_data, proposed_action, policy)
 
     decision_id = f"dec_{uuid.uuid4().hex[:8]}"
 

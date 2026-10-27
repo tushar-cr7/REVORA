@@ -28,7 +28,7 @@ const STAGE_TONE = [
   { ring: 'border-success-500/50', icon: 'text-success-300', glow: 'bg-success-500/20', stroke: '#10B981' },
 ];
 
-const DIM = { ring: 'border-border-strong', icon: 'text-text-disabled', glow: 'bg-transparent', stroke: '#2A3646' };
+const DIM = { ring: 'border-border-strong', icon: 'text-text-disabled', glow: 'bg-transparent', stroke: '#343D4A' };
 const BLOCKED = { ring: 'border-warning-500/70', icon: 'text-warning-300', glow: 'bg-warning-500/20', stroke: '#F5A623' };
 const AMBER = '#F5A623';
 

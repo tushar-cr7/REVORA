@@ -1,0 +1,59 @@
+import uuid
+
+from fastapi.testclient import TestClient
+from backend.app.main import app
+
+client = TestClient(app)
+
+
+def _seed_and_execute_one() -> str:
+    client.post("/api/scan", json={"n_total": 50, "seed": 42})
+    client.post("/api/analyze")
+    # The repository is a process-wide singleton and an identical scan re-activates the same
+    # run, so earlier tests may already have executed some of its transactions. A case runs at
+    # most once per authorization, so pick a transaction that has not been executed yet.
+    executed = {i["transaction_id"] for i in client.get("/api/interventions").json()["interventions"]}
+    tx_id = next(t["transaction_id"] for t in client.get("/api/transactions?limit=50").json() if t["transaction_id"] not in executed)
+    # Every call still needs a fresh idempotency key or a replayed execution would log no new audit event.
+    exec_resp = client.post(
+        f"/api/interventions/{tx_id}/execute", headers={"Idempotency-Key": f"audit_filter_{uuid.uuid4().hex}"}
+    )
+    assert exec_resp.status_code == 200
+    return tx_id
+
+
+def test_audit_default_order_and_counts_are_backward_compatible():
+    _seed_and_execute_one()
+
+    body = client.get("/api/audit?limit=5").json()
+    assert body["total"] == len(body["entries"]) == 5
+    # `matched` describes the whole filtered log, not the truncated page.
+    assert body["matched"] >= body["total"]
+    assert sum(body["counts_by_type"].values()) == body["matched"]
+
+    # Default ordering is still oldest-first: the analyze-pass decision events come first.
+    assert body["entries"][0]["event_type"] in ("DECISION_CREATED", "ACTION_BLOCKED")
+
+
+def test_audit_filters_by_transaction_and_returns_newest_first():
+    tx_id = _seed_and_execute_one()
+
+    oldest = client.get(f"/api/audit?transaction_id={tx_id}").json()
+    newest = client.get(f"/api/audit?transaction_id={tx_id}&newest_first=true").json()
+
+    assert newest["matched"] == oldest["matched"] >= 2
+    assert all(e["transaction_id"] == tx_id for e in newest["entries"])
+    assert [e["event_id"] for e in newest["entries"]] == [e["event_id"] for e in reversed(oldest["entries"])]
+
+    # The most recent event for the transaction is the execution-side one.
+    assert newest["entries"][0]["intervention_id"] is not None
+    assert oldest["entries"][0]["event_type"] in ("DECISION_CREATED", "ACTION_BLOCKED")
+
+
+def test_audit_unknown_transaction_matches_nothing():
+    _seed_and_execute_one()
+
+    body = client.get("/api/audit?transaction_id=tx_does_not_exist").json()
+    assert body["entries"] == []
+    assert body["matched"] == 0
+    assert body["counts_by_type"] == {}

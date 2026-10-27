@@ -1,8 +1,7 @@
 import random
-import uuid
 from datetime import datetime, timezone
 from typing import Dict, Any, Optional
-from backend.app.domain.models import Intervention
+from backend.app.domain.models import Intervention, new_id
 from backend.app.integrations.base import PaymentExecutionProvider
 
 random.seed(7)
@@ -17,9 +16,21 @@ RAZORPAY_ENDPOINT_MAP = {
 
 
 class SimulationProvider(PaymentExecutionProvider):
+    """
+    Simulated execution: no payment, reminder or link is ever sent. Outcomes are
+    drawn from the action's scored probability. Pass `rng` for reproducible runs.
+    """
+
+    def __init__(self, rng: Optional[random.Random] = None):
+        self._rng = rng if rng is not None else random
+
     @property
     def name(self) -> str:
         return "SimulationProvider"
+
+    @property
+    def execution_mode(self) -> str:
+        return "simulation"
 
     def execute(
         self,
@@ -29,7 +40,7 @@ class SimulationProvider(PaymentExecutionProvider):
     ) -> Intervention:
         final_action = decision["final_action"]
         amount = float(leak["amount"])
-        intervention_id = f"itv_{uuid.uuid4().hex[:8]}"
+        intervention_id = new_id("itv", 16)  # a primary key in a durable store: wide enough not to collide
         timestamp = datetime.now(timezone.utc).isoformat()
 
         customer_id = leak.get("customer_id", "cust_unknown")
@@ -58,6 +69,7 @@ class SimulationProvider(PaymentExecutionProvider):
                 timestamp=timestamp,
                 execution_probability_used=0.0,
                 idempotency_key=idempotency_key,
+                execution_mode=self.execution_mode,
             )
 
         if final_action == "escalate":
@@ -80,12 +92,13 @@ class SimulationProvider(PaymentExecutionProvider):
                 timestamp=timestamp,
                 execution_probability_used=0.0,
                 idempotency_key=idempotency_key,
+                execution_mode=self.execution_mode,
             )
 
         matching = next((c for c in decision.get("candidates_evaluated", []) if c["action"] == final_action), None)
         prob = matching["probability"] if matching else decision.get("ai_proposed_probability", 0.5)
 
-        success = random.random() < prob
+        success = self._rng.random() < prob
         status = "recovered" if success else "attempted_no_recovery"
         recovered_amount = round(amount, 2) if success else 0.0
 
@@ -108,4 +121,5 @@ class SimulationProvider(PaymentExecutionProvider):
             timestamp=timestamp,
             execution_probability_used=round(prob, 4),
             idempotency_key=idempotency_key,
+            execution_mode=self.execution_mode,
         )

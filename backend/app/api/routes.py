@@ -1,5 +1,7 @@
 from typing import Optional, List, Dict, Any
-from fastapi import APIRouter, Header, HTTPException, Query
+import psycopg2
+from fastapi import APIRouter, Body, Header, HTTPException, Query, Response
+from fastapi.responses import JSONResponse
 from backend.app.api.schemas import (
     HealthResponse,
     ScanRequest,
@@ -13,18 +15,27 @@ from backend.app.api.schemas import (
     InterventionsResponse,
     EscalationsResponse,
     AnalyticsResponse,
+    ExecuteRequest,
     CopilotQueryRequest,
     CopilotQueryResponse,
 )
-from backend.app.domain.policy import DEFAULT_POLICY, PolicyLimits
-from backend.app.repositories.in_memory import repo
-from backend.app.services.audit_service import AuditService
-from backend.app.services.recovery_service import RecoveryService
+from backend.app.api.runtime import container, server_error
+from backend.app.domain.models import InvalidCaseTransition
+from backend.app.domain.policy import POLICY_VERSION, PolicyLimits
+from backend.app.services.execution_service import ExecutionError
 
 router = APIRouter(prefix="/api", tags=["revenue"])
 
-audit_service = AuditService(repo=repo)
-recovery_service = RecoveryService(repo=repo, audit_service=audit_service)
+# The repository is chosen by configuration (REVORA_STORAGE), not hard-wired here.
+repo = container.repo
+audit_service = container.audit_service
+recovery_service = container.recovery_service
+
+
+def _execution_error_response(e: ExecutionError) -> JSONResponse:
+    """Typed error body: `detail` is always a plain string, with machine-readable `code` and context beside it."""
+    headers = {"Idempotent-Replayed": "true"} if e.replayed else None
+    return JSONResponse(status_code=e.status_code, content=e.to_body(), headers=headers)
 
 
 @router.get("/health", response_model=HealthResponse)
@@ -32,11 +43,31 @@ def health():
     return HealthResponse(status="ok")
 
 
+@router.get("/health/ready")
+def health_ready():
+    """
+    Readiness: can the process reach its store, and is the schema the one this code expects?
+    Also states plainly whether the store is durable, so a demo on in-memory state cannot be mistaken
+    for a deployment that keeps its records.
+    """
+    try:
+        storage = repo.describe()
+    except Exception as e:  # noqa: BLE001 - reported as not-ready, never as a stack trace
+        return JSONResponse(
+            status_code=503,
+            content={"status": "unavailable", "detail": "The data store is not reachable or its schema is not ready.",
+                     "reason": type(e).__name__},
+        )
+    return {"status": "ok", "storage": storage}
+
+
 @router.post("/scan", response_model=ScanResponse)
 def scan_revenue(req: ScanRequest = ScanRequest()):
     try:
         res = recovery_service.scan_revenue(n_total=req.n_total, seed=req.seed, merchant_id=req.merchant_id)
         return ScanResponse(**res)
+    except psycopg2.Error as e:
+        raise server_error("Scan failed", e)
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -49,7 +80,14 @@ def analyze_revenue():
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Analysis failed: {str(e)}")
+        raise server_error("Analysis failed", e)
+
+
+@router.get("/runs")
+def get_runs():
+    runs = recovery_service.get_runs()
+    active = repo.get_active_run()
+    return {"total": len(runs), "active_run_id": active.run_id if active else None, "runs": runs}
 
 
 @router.get("/transactions")
@@ -81,19 +119,55 @@ def get_decision(id: str):
     return dec
 
 
+@router.get("/cases")
+def get_cases(
+    limit: int = Query(default=100, ge=1, le=1000),
+    state: Optional[str] = Query(default=None),
+    run_id: Optional[str] = Query(default=None, description="Defaults to the active run; 'all' for every run."),
+):
+    cases = recovery_service.get_cases(limit=limit, state=state, run_id=run_id)
+    return {"total": len(cases), "cases": cases}
+
+
+@router.get("/cases/{case_id}")
+def get_case(case_id: str):
+    case = recovery_service.get_case_detail(case_id)
+    if not case:
+        raise HTTPException(status_code=404, detail=f"Case {case_id} not found.")
+    return case
+
+
 @router.post("/interventions/{id}/execute")
 def execute_intervention(
     id: str,
+    response: Response,
+    body: Optional[ExecuteRequest] = Body(default=None),
     idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
     x_idempotency_key: Optional[str] = Header(default=None, alias="X-Idempotency-Key"),
 ):
+    """
+    Execute the recovery action authorized for a case (`id` = transaction id, leak id or case id).
+
+    Policy is re-evaluated against current state before anything runs. Send an
+    `Idempotency-Key`: the same key with the same request returns the original result
+    (header `Idempotent-Replayed: true`); the same key with a different request is 422.
+    409 = refused without effect (policy denial, case not executable, request in flight).
+    """
     key = idempotency_key or x_idempotency_key
+    expected = body.expected_action.value if body and body.expected_action else None
     try:
-        return recovery_service.execute_individual_intervention(target_id=id, idempotency_key=key)
+        outcome = recovery_service.execute_case(target_id=id, idempotency_key=key, expected_action=expected)
+    except ExecutionError as e:
+        return _execution_error_response(e)
+    except InvalidCaseTransition as e:
+        raise HTTPException(status_code=409, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Intervention execution failed: {str(e)}")
+        raise server_error("Intervention execution failed", e)
+    if outcome.replayed:
+        response.headers["Idempotent-Replayed"] = "true"
+    return outcome.intervention
 
 
 @router.post("/recover", response_model=RecoverResponse)
@@ -104,12 +178,15 @@ def recover_revenue():
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Recovery failed: {str(e)}")
+        raise server_error("Recovery failed", e)
 
 
 @router.get("/interventions", response_model=InterventionsResponse)
-def get_interventions(limit: int = Query(default=100, ge=1, le=1000)):
-    interventions = recovery_service.get_interventions(limit=limit)
+def get_interventions(
+    limit: int = Query(default=100, ge=1, le=1000),
+    run_id: Optional[str] = Query(default=None, description="Defaults to the active run; 'all' for every run."),
+):
+    interventions = recovery_service.get_interventions(limit=limit, run_id=run_id)
     return InterventionsResponse(total=len(interventions), interventions=interventions)
 
 
@@ -130,29 +207,43 @@ def get_audit(
     limit: int = Query(default=200, ge=1, le=1000),
     leak_type: Optional[str] = Query(default=None),
     status: Optional[str] = Query(default=None),
+    transaction_id: Optional[str] = Query(default=None),
+    newest_first: bool = Query(default=False),
+    run_id: Optional[str] = Query(default=None, description="Defaults to the active run; 'all' for full history."),
 ):
-    entries = audit_service.get_audit_log(limit=limit, leak_type=leak_type, status=status)
-    return AuditLogResponse(total=len(entries), entries=entries)
+    entries = audit_service.get_audit_log(
+        limit=limit,
+        leak_type=leak_type,
+        status=status,
+        transaction_id=transaction_id,
+        newest_first=newest_first,
+        run_id=run_id,
+    )
+    summary = audit_service.summarize_audit_log(
+        leak_type=leak_type, status=status, transaction_id=transaction_id, run_id=run_id
+    )
+    return AuditLogResponse(total=len(entries), entries=entries, **summary)
 
 
 @router.get("/policies")
 def get_policies():
     return {
-        "active_policy": DEFAULT_POLICY.to_dict(),
-        "policy_version": "1.0.0",
+        "active_policy": recovery_service.policy.to_dict(),
+        "policy_version": POLICY_VERSION,
         "description": "Deterministic system guardrails governing autonomous revenue recovery.",
     }
 
 
 @router.post("/simulate", response_model=PolicySimulateResponse)
 def simulate_policy(req: PolicySimulateRequest):
+    base = recovery_service.policy
     custom_policy = PolicyLimits(
-        max_retries=req.max_retries if req.max_retries is not None else DEFAULT_POLICY.max_retries,
-        min_cooldown_hours=req.min_cooldown_hours if req.min_cooldown_hours is not None else DEFAULT_POLICY.min_cooldown_hours,
-        max_customer_contacts_per_day=req.max_customer_contacts_per_day if req.max_customer_contacts_per_day is not None else DEFAULT_POLICY.max_customer_contacts_per_day,
-        max_auto_recovery_value=req.max_auto_recovery_value if req.max_auto_recovery_value is not None else DEFAULT_POLICY.max_auto_recovery_value,
-        max_subscription_consecutive_failures_for_retry=req.max_subscription_consecutive_failures_for_retry if req.max_subscription_consecutive_failures_for_retry is not None else DEFAULT_POLICY.max_subscription_consecutive_failures_for_retry,
-        invoice_escalation_age_days=req.invoice_escalation_age_days if req.invoice_escalation_age_days is not None else DEFAULT_POLICY.invoice_escalation_age_days,
+        max_retries=req.max_retries if req.max_retries is not None else base.max_retries,
+        min_cooldown_hours=req.min_cooldown_hours if req.min_cooldown_hours is not None else base.min_cooldown_hours,
+        max_customer_contacts_per_day=req.max_customer_contacts_per_day if req.max_customer_contacts_per_day is not None else base.max_customer_contacts_per_day,
+        max_auto_recovery_value=req.max_auto_recovery_value if req.max_auto_recovery_value is not None else base.max_auto_recovery_value,
+        max_subscription_consecutive_failures_for_retry=req.max_subscription_consecutive_failures_for_retry if req.max_subscription_consecutive_failures_for_retry is not None else base.max_subscription_consecutive_failures_for_retry,
+        invoice_escalation_age_days=req.invoice_escalation_age_days if req.invoice_escalation_age_days is not None else base.invoice_escalation_age_days,
     )
     try:
         res = recovery_service.simulate_policy(custom_policy)
@@ -178,5 +269,4 @@ def query_copilot(req: CopilotQueryRequest):
         res = recovery_service.copilot_query(query=req.query, transaction_id=req.transaction_id)
         return CopilotQueryResponse(**res)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Copilot query failed: {str(e)}")
-
+        raise server_error("Copilot query failed", e)

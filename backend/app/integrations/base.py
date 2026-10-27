@@ -9,6 +9,16 @@ class PaymentExecutionProvider(ABC):
     def name(self) -> str:
         pass
 
+    @property
+    def execution_mode(self) -> str:
+        """
+        "simulation" when no real external action is taken, "live" for a real
+        payment/communication provider. A provider must declare itself; the
+        default is deliberately not "live" so an undeclared one is never
+        mistaken for a real, verified integration.
+        """
+        return "unknown"
+
     @abstractmethod
     def execute(
         self,

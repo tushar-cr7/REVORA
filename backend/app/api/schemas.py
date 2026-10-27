@@ -1,5 +1,6 @@
 from typing import Dict, Any, List, Optional
 from pydantic import BaseModel, Field
+from backend.app.domain.models import Action
 
 
 class HealthResponse(BaseModel):
@@ -16,6 +17,11 @@ class ScanResponse(BaseModel):
     total_transactions_scanned: int
     total_at_risk: float
     breakdown: List[Dict[str, Any]]
+    # Scan run identity. `reused_existing_run` is true when this scan's source data (merchant,
+    # size, seed) matched an earlier run, which was re-activated with its state intact.
+    run_id: Optional[str] = None
+    reused_existing_run: bool = False
+    superseded_run_id: Optional[str] = None
 
 
 class AnalyzeResponse(BaseModel):
@@ -26,6 +32,7 @@ class AnalyzeResponse(BaseModel):
     policy_blocked_count: int
     avg_recovery_probability: float
     model_metadata: Dict[str, Any]
+    run_id: Optional[str] = None
 
 
 class RecoverResponse(BaseModel):
@@ -37,12 +44,28 @@ class RecoverResponse(BaseModel):
     attempted_count: int
     avg_recovery_value: float
     intervention_success_rate_pct: float
+    # Computed from the attempt ledger: attempts that ran without an allowed execution-time authorization.
     policy_violations: int
+    # Totals above are for the whole active run (unique outcomes). The *_now fields describe this call only.
+    run_id: Optional[str] = None
+    execution_mode: Optional[str] = None
+    executed_now: int = 0
+    recovered_now: int = 0
+    not_recovered_now: int = 0
+    suppressed_now: int = 0
+    escalated_now: int = 0
+    failed_now: int = 0
+    blocked_now: int = 0
+    skipped_now: int = 0
 
 
 class AuditLogResponse(BaseModel):
+    # `total` is the number of entries returned (after `limit`); `matched` and
+    # `counts_by_type` describe the full filtered log before the limit.
     total: int
     entries: List[Dict[str, Any]]
+    matched: Optional[int] = None
+    counts_by_type: Dict[str, int] = Field(default_factory=dict)
 
 
 class PolicySimulateRequest(BaseModel):
@@ -92,6 +115,16 @@ class AnalyticsResponse(BaseModel):
     intervention_success_rate_pct: float
     policy_blocked_count: int
     escalation_count: int
+    # Amount of cases that had at least one recovery attempt (not the same as recovered).
+    attempted_amount: float = 0.0
+    run_id: Optional[str] = None
+    execution_mode: Optional[str] = None  # "simulation": nothing was sent to a payment network
+
+
+class ExecuteRequest(BaseModel):
+    """Optional body for POST /interventions/{id}/execute."""
+    # Guard: execute only if the case's currently authorized action is this one.
+    expected_action: Optional[Action] = None
 
 
 class CopilotQueryRequest(BaseModel):

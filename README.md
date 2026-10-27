@@ -80,14 +80,17 @@ right call is treated as a first-class product behavior, not an omission).
 ## Implementation Status
 
 **Built and working today:**
-- `backend/` — Modular FastAPI application (`backend/app/main.py`) with clean domain models (`Transaction`, `Decision`, `Intervention`, `AuditEvent`), synthetic data generator, trained XGBoost recovery model, EV decision engine, deterministic policy engine, simulation provider, in-memory repository boundary, idempotency key header support (`Idempotency-Key`), and full audit logging.
-- `backend/tests/` — Automated pytest test suite containing 21 passing unit & integration tests (`test_decision_engine.py`, `test_policy_engine.py`, `test_executor.py`, `test_pipeline.py`, `test_api.py`).
+- `backend/` — Modular FastAPI application (`backend/app/main.py`) with clean domain models (`Transaction`, `Decision`, `Intervention`, `AuditEvent`, plus `ScanRun`, `RecoveryCase` and the `ExecutionAttempt` ledger), synthetic data generator, trained XGBoost recovery model, EV decision engine, deterministic policy engine (re-evaluated against the attempt ledger at execution, fail-closed on missing inputs), simulation provider, scoped idempotency (`Idempotency-Key`) and audit logging. See `docs/RECOVERY_LIFECYCLE.md`. Execution is a simulation: nothing real is paid, sent or created.
+- **Durable persistence (Phase 2)** — a PostgreSQL repository with versioned SQL migrations, transactions, row locks, unique indexes and CHECK constraints (`backend/app/repositories/postgres.py`, `backend/app/db/`). The backend must be told where to keep state (`REVORA_STORAGE=postgres|memory`) and refuses to start on a misconfiguration; there is no silent in-memory fallback. See `docs/DURABLE_FOUNDATION.md`.
+- **Event ingestion foundation (Phase 2)** — a provider-agnostic normalized event contract, `POST /api/ingest/events`, deduplication, out-of-order-safe obligation projection, and a detection boundary that opens/closes *inert* recovery cases for failed payments, failed subscription renewals and overdue invoices. It executes nothing, no real provider adapter exists, and no real merchant data has been connected.
+- `backend/tests/` — Automated pytest suite of 462 tests (all passing on 2026-10-23 against PostgreSQL 18.6; this shows the tested behaviour works, not that the system is production-ready): the 185 Phase 1 tests (decision engine, policy engine incl. strict gate, case state machine, executor, pipeline, API, audit filters, recovery-lifecycle / execution-API regressions) plus the remainder for Phase 2 (storage configuration, migrations and every database constraint, repository contract on both repositories, execution safety and multi-connection concurrency on PostgreSQL, interrupted-execution recovery, real-process restart, event contract/projection/ingestion/detection, ingestion API). Database tests run against a real PostgreSQL (a disposable cluster is started from the local binaries, or `REVORA_TEST_DATABASE_URL`); without PostgreSQL they skip and say so.
 - `frontend/` — Next.js UI application (React/Tailwind) featuring Mission Control dashboard, Top Opportunities list, interactive recovery pipeline, KPIs, and Audit log.
 
 **Not yet built (spec-only):**
-- PostgreSQL persistence — current backend holds state behind `InMemoryRepository` interface for seamless migration to `PostgresRepository`.
-- Live Razorpay execution — currently using SimulationProvider for execution.
-- Authentication — currently single-tenant demo mode.
+- Live Razorpay (or any real) execution — currently using SimulationProvider for execution.
+- A provider webhook adapter — only the interface and an identity adapter exist; there is no verified provider contract.
+- Authentication and tenancy — currently single-tenant demo mode; the ingestion and execute endpoints are open and `claimed_merchant_id` is only a claim.
+- Making event-derived cases decidable/executable, real revenue-leak detection on connected data, a scheduler for interrupted-execution recovery, audit tamper-evidence, backups/HA.
 
 ## Development Setup
 
@@ -96,13 +99,20 @@ right call is treated as a first-class product behavior, not an omission).
 # Install dependencies
 pip install -r backend/requirements.txt
 
-# Start backend server
+# Choose where state lives (see .env.example). Durable:
+export REVORA_STORAGE=postgres
+export DATABASE_URL=postgresql://revora_app:<password>@localhost:5432/revora
+python -m backend.app.db.migrate upgrade        # create / update the schema
+# ...or, explicitly NOT durable (everything is lost on restart): export REVORA_STORAGE=memory
+
+# Start backend server (it refuses to start if storage is unset or misconfigured)
 python -m uvicorn backend.app.main:app --port 8000
 ```
 
 ### Run Tests
 ```bash
-pytest backend/tests -v
+pytest backend/tests -v          # database tests start a throwaway PostgreSQL if one is installed locally
+REVORA_REQUIRE_POSTGRES=1 pytest backend/tests    # fail instead of skipping when PostgreSQL is unavailable
 ```
 
 ## Folder Structure

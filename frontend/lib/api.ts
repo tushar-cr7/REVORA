@@ -5,7 +5,7 @@ import {
   Transaction,
   Decision,
   Intervention,
-  AuditEvent,
+  AuditLogResponse,
   Opportunity,
   PolicyLimits,
   SimulateResponse,
@@ -83,7 +83,15 @@ export const api = {
     const params = new URLSearchParams({ limit: limit.toString() });
     if (leak_type) params.append('leak_type', leak_type);
     if (status) params.append('status', status);
-    return fetchJson<{ total: number; entries: AuditEvent[] }>(`/api/audit?${params.toString()}`);
+    return fetchJson<AuditLogResponse>(`/api/audit?${params.toString()}`);
+  },
+
+  getAuditTrail: (opts: { limit?: number; status?: string; transaction_id?: string; newest_first?: boolean } = {}) => {
+    const params = new URLSearchParams({ limit: String(opts.limit ?? 200) });
+    if (opts.status) params.append('status', opts.status);
+    if (opts.transaction_id) params.append('transaction_id', opts.transaction_id);
+    if (opts.newest_first) params.append('newest_first', 'true');
+    return fetchJson<AuditLogResponse>(`/api/audit?${params.toString()}`);
   },
 
   getPolicies: () =>

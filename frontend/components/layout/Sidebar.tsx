@@ -56,14 +56,14 @@ export const Sidebar: React.FC = () => {
   const pathname = usePathname();
 
   return (
-    <aside className="w-64 bg-surface border-r border-border-subtle flex flex-col justify-between shrink-0 hidden md:flex">
-      <div className="py-6 px-4 space-y-8 overflow-y-auto">
+    <aside className="w-60 bg-surface border-r border-border-subtle flex flex-col justify-between shrink-0 hidden md:flex">
+      <div className="py-5 px-3 space-y-6 overflow-y-auto">
         {navGroups.map((group, gIdx) => (
-          <div key={gIdx} className="space-y-2">
-            <h3 className="px-3 text-[11px] font-semibold text-text-muted uppercase tracking-wider">
+          <div key={gIdx} className="space-y-1.5">
+            <h3 className="rv-label rv-label-rule px-3 pb-1">
               {group.title}
             </h3>
-            <div className="space-y-1">
+            <div className="space-y-px">
               {group.items.map((item) => {
                 const Icon = item.icon;
                 const isActive = pathname === item.href || pathname.startsWith(item.href + '/');
@@ -71,13 +71,13 @@ export const Sidebar: React.FC = () => {
                   <Link
                     key={item.href}
                     href={item.href}
-                    className={`w-full flex items-center justify-between px-3 py-2 rounded-md text-[13px] font-medium transition-colors relative group ${
+                    className={`w-full flex items-center justify-between h-8 px-3 rounded-md text-[13px] font-medium tracking-[-0.005em] transition-colors relative group ${
                       isActive
-                        ? 'text-text-primary bg-panel-raised'
-                        : 'text-text-secondary hover:text-text-primary hover:bg-panel/50'
+                        ? 'text-text-primary bg-panel shadow-edge'
+                        : 'text-text-secondary hover:text-text-primary hover:bg-panel/60'
                     }`}
                   >
-                    <div className="flex items-center space-x-3">
+                    <div className="flex items-center gap-3">
                       <Icon
                         strokeWidth={1.75}
                         className={`w-4 h-4 ${isActive ? 'text-primary-400' : 'text-text-muted group-hover:text-text-secondary'} transition-colors`}
@@ -85,9 +85,9 @@ export const Sidebar: React.FC = () => {
                       <span>{item.label}</span>
                     </div>
                     {isActive && (
-                      <motion.div 
+                      <motion.div
                         layoutId="activeNav"
-                        className="absolute left-0 top-1.5 bottom-1.5 w-0.5 bg-primary-500 rounded-r-full"
+                        className="absolute -left-3 top-1.5 bottom-1.5 w-[2px] bg-primary-500 rounded-r-full"
                         transition={{ type: "spring", stiffness: 300, damping: 30 }}
                       />
                     )}
@@ -99,24 +99,35 @@ export const Sidebar: React.FC = () => {
         ))}
       </div>
 
-      <div className="p-4 border-t border-border-subtle">
-        <div className="space-y-1 mb-4">
-          <Link
-            href="/copilot"
-            className={`w-full flex items-center justify-between px-3 py-2 rounded-md text-[13px] font-medium transition-colors ${
-              pathname.startsWith('/copilot')
-                ? 'text-text-primary bg-panel-raised'
-                : 'text-text-secondary hover:text-text-primary hover:bg-panel/50'
-            }`}
-          >
-            <div className="flex items-center space-x-3">
-              <Sparkles strokeWidth={1.75} className={`w-4 h-4 ${pathname.startsWith('/copilot') ? 'text-ai-400' : 'text-text-muted'}`} />
-              <span>AI Copilot</span>
-            </div>
-            <span className="px-1.5 py-0.5 rounded text-[10px] font-mono bg-ai-500/20 text-ai-300 border border-ai-500/30">
-              BETA
-            </span>
-          </Link>
+      <div className="px-3 pt-3 pb-4 border-t border-border-subtle space-y-4">
+        <Link
+          href="/copilot"
+          className={`w-full flex items-center justify-between h-8 px-3 rounded-md text-[13px] font-medium tracking-[-0.005em] transition-colors ${
+            pathname.startsWith('/copilot')
+              ? 'text-text-primary bg-panel shadow-edge'
+              : 'text-text-secondary hover:text-text-primary hover:bg-panel/60'
+          }`}
+        >
+          <div className="flex items-center gap-3">
+            <Sparkles strokeWidth={1.75} className={`w-4 h-4 ${pathname.startsWith('/copilot') ? 'text-ai-400' : 'text-text-muted'}`} />
+            <span>AI Copilot</span>
+          </div>
+          <span className="px-1.5 py-px rounded-sm text-[9px] font-mono font-medium tracking-[0.1em] bg-ai-500/10 text-ai-300 border border-ai-500/25">
+            BETA
+          </span>
+        </Link>
+
+        {/* The product's one rule, as a legend: the violet node is intelligence,
+            the silver square is the policy boundary that governs it. */}
+        <div className="px-3 space-y-1.5 font-mono text-[9.5px] font-medium tracking-[0.14em] uppercase leading-none">
+          <div className="flex items-center gap-2 text-text-muted" data-kind="decision">
+            <span className="rv-node" aria-hidden />
+            <span>AI for intelligence</span>
+          </div>
+          <div className="flex items-center gap-2 text-text-secondary" data-kind="policy">
+            <span className="rv-node" aria-hidden />
+            <span>Rules for control</span>
+          </div>
         </div>
       </div>
     </aside>

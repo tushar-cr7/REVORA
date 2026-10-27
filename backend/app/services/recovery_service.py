@@ -1,10 +1,26 @@
 from collections import defaultdict
+from datetime import datetime, timedelta
+import hashlib
 import os
-from typing import Dict, Any, List, Optional
+from typing import Callable, Dict, Any, List, Optional
 import pandas as pd
 from backend.app.config import settings
-from backend.app.domain.models import Transaction, Decision, Intervention, AuditEventType
-from backend.app.domain.policy import DEFAULT_POLICY, PolicyLimits
+from backend.app.domain.models import (
+    COUNTED_ATTEMPT_STATUSES,
+    CUSTOMER_CONTACT_ACTIONS,
+    FROZEN_CASE_STATES,
+    RECOVERY_ACTIONS,
+    AttemptStatus,
+    AuditEventType,
+    CaseState,
+    Decision,
+    RecoveryCase,
+    ScanRun,
+    Transaction,
+    new_id,
+    utc_now_iso,
+)
+from backend.app.domain.policy import DEFAULT_POLICY, POLICY_VERSION, PolicyLimits, evaluate_policy_strict
 from backend.app.intelligence.data_gen import generate_dataset
 from backend.app.intelligence.model import RecoveryModel
 from backend.app.intelligence.decision_engine import decide_intervention
@@ -12,11 +28,34 @@ from backend.app.integrations.base import PaymentExecutionProvider
 from backend.app.integrations.simulation import SimulationProvider
 from backend.app.repositories.base import BaseRepository
 from backend.app.services.audit_service import AuditService
+from backend.app.services.execution_service import (
+    CONTACT_WINDOW,
+    CaseConflict,
+    ExecutionOutcome,
+    ExecutionService,
+    IdempotencyInProgress,
+    PolicyDenied,
+    ProviderFailure,
+    ReplayedExecutionError,
+    StaleRun,
+)
+
+
+# Cases analysed per unit of work. A unit holds row locks on its cases, so it stays small enough that
+# an execution request waits well under a second; large enough that round trips are amortised.
+ANALYZE_CHUNK = 200
 
 
 def _safe_int(val, default: int = 0) -> int:
     if val is None or pd.isna(val):
         return default
+    return int(val)
+
+
+def _opt_int(val) -> Optional[int]:
+    """Like _safe_int, but a missing value stays None instead of becoming 0 (it must fail closed later)."""
+    if val is None or pd.isna(val):
+        return None
     return int(val)
 
 
@@ -26,6 +65,15 @@ def _safe_bool(val, default: bool = False) -> bool:
     return bool(val)
 
 
+def scan_fingerprint(merchant_id: str, n_total: int, seed: int) -> str:
+    """
+    Identity of a scan's source data. The synthetic generator is a pure function of
+    (merchant, size, seed), so equal fingerprints mean equal data: repeating such a
+    scan re-activates the existing run rather than creating a look-alike with fresh state.
+    """
+    return hashlib.sha256(f"{merchant_id}|{n_total}|{seed}".encode("utf-8")).hexdigest()[:16]
+
+
 class RecoveryService:
     def __init__(
         self,
@@ -33,12 +81,26 @@ class RecoveryService:
         audit_service: AuditService,
         provider: Optional[PaymentExecutionProvider] = None,
         model_path: Optional[str] = None,
+        policy: Optional[PolicyLimits] = None,
+        clock: Optional[Callable[[], datetime]] = None,
+        reservation_timeout: Optional[timedelta] = None,
     ):
         self.repo = repo
         self.audit_service = audit_service
         self.provider = provider or SimulationProvider()
+        self.policy = policy or DEFAULT_POLICY
         self.model_path = model_path or settings.MODEL_PATH
         self.model: Optional[RecoveryModel] = None
+        # One safe execution pathway, shared by individual and bulk execution.
+        self.executor = ExecutionService(
+            repo=repo,
+            audit_service=audit_service,
+            provider_source=lambda: self.provider,
+            policy_source=lambda: self.policy,
+            decide_case=self._decide_single_case,
+            clock=clock,
+            reservation_timeout=reservation_timeout,
+        )
 
     def _ensure_model(self) -> RecoveryModel:
         if self.model is None:
@@ -59,12 +121,34 @@ class RecoveryService:
                 self.model = m
         return self.model
 
+    # ── scan ─────────────────────────────────────────────────────────────
     def scan_revenue(self, n_total: int = 10000, seed: int = 42, merchant_id: str = "merch_001") -> Dict[str, Any]:
+        """
+        Ingest a dataset as a scan run.
+
+        * New source data (merchant, size, seed not seen before) creates a new run with
+          fresh cases and makes it the active run. The previously active run is marked
+          `superseded` — never deleted — so its decisions, attempts, interventions and
+          audit events keep pointing at the transactions they were made for.
+        * Identical source data re-activates the existing run with all of its state, so
+          repeating a scan (the dashboard does, on every page load) cannot reset history
+          or reopen cases that already ran.
+        """
+        fingerprint = scan_fingerprint(merchant_id, n_total, seed)
+        previous = self.repo.get_active_run()
+
+        existing = self.repo.find_run_by_fingerprint(fingerprint)
+        if existing is not None:
+            run = self.repo.activate_run(existing.run_id)
+            return self._scan_summary(run, reused=True, previous=previous)
+
         df, _ = generate_dataset(n_total=n_total, seed=seed, merchant_id=merchant_id)
-        
+        run_id = new_id("run", 8)
+
         transactions: List[Transaction] = []
         for _, row in df.iterrows():
             d = row.to_dict()
+            is_subscription = d["leak_type"] == "failed_subscription"
             tx = Transaction(
                 transaction_id=d["transaction_id"],
                 leak_id=d["leak_id"],
@@ -76,36 +160,165 @@ class RecoveryService:
                 failure_code=d["failure_code"],
                 prior_successful_payments=_safe_int(d.get("prior_successful_payments")),
                 ltv_bucket=d["ltv_bucket"],
-                retries_so_far=_safe_int(d.get("retries_so_far")),
-                hours_since_event=_safe_int(d.get("hours_since_event")),
-                age_days=_safe_int(d.get("age_days")),
+                retries_so_far=_opt_int(d.get("retries_so_far")),
+                hours_since_event=_opt_int(d.get("hours_since_event")),
+                age_days=_opt_int(d.get("age_days")) if d["leak_type"] == "overdue_invoice" else _safe_int(d.get("age_days")),
                 event_time=d["event_time"],
                 merchant_segment=d["merchant_segment"],
                 payment_id=None if pd.isna(d.get("payment_id")) else str(d.get("payment_id")),
                 visit_count=_safe_int(d.get("visit_count")),
                 reached_payment_page=_safe_bool(d.get("reached_payment_page")),
-                consecutive_failures=_safe_int(d.get("consecutive_failures")),
+                consecutive_failures=_opt_int(d.get("consecutive_failures")) if is_subscription else _safe_int(d.get("consecutive_failures")),
                 subscription_age_days=_safe_int(d.get("subscription_age_days")),
+                run_id=run_id,
             )
             transactions.append(tx)
 
-        self.repo.save_transactions(transactions)
-
-        by_type = df.groupby("leak_type")["amount"].agg(["sum", "count"]).reset_index()
-        breakdown = [
-            {"leak_type": row["leak_type"], "amount_at_risk": round(row["sum"], 2), "count": int(row["count"])}
-            for _, row in by_type.iterrows()
+        suffix = run_id.split("_", 1)[1]
+        cases = [
+            RecoveryCase(
+                case_id=f"case_{suffix}_{tx.leak_id}",
+                run_id=run_id,
+                merchant_id=tx.merchant_id,
+                transaction_id=tx.transaction_id,
+                leak_id=tx.leak_id,
+                customer_id=tx.customer_id,
+                leak_type=tx.leak_type,
+                amount=tx.amount,
+            )
+            for tx in transactions
         ]
-        total_at_risk = round(float(df["amount"].sum()), 2)
+        now = utc_now_iso()
+        run = ScanRun(
+            run_id=run_id,
+            merchant_id=merchant_id,
+            source_fingerprint=fingerprint,
+            n_total=n_total,
+            seed=seed,
+            created_at=now,
+            last_scanned_at=now,
+            transaction_count=len(transactions),
+            total_at_risk=round(sum(tx.amount for tx in transactions), 2),
+        )
+        run, created = self.repo.register_scan_run(run, transactions, cases)
+        return self._scan_summary(run, reused=not created, previous=previous)
 
+    def _scan_summary(self, run: ScanRun, reused: bool, previous: Optional[ScanRun]) -> Dict[str, Any]:
+        transactions = self.repo.get_all_transactions(run.run_id)
+        by_type: Dict[str, Dict[str, float]] = defaultdict(lambda: {"sum": 0.0, "count": 0})
+        for tx in transactions:
+            by_type[tx.leak_type]["sum"] += tx.amount
+            by_type[tx.leak_type]["count"] += 1
+        breakdown = [
+            {"leak_type": lt, "amount_at_risk": round(v["sum"], 2), "count": int(v["count"])}
+            for lt, v in sorted(by_type.items())
+        ]
         return {
-            "total_transactions_scanned": n_total,
-            "total_at_risk": total_at_risk,
+            "total_transactions_scanned": run.transaction_count,
+            "total_at_risk": round(sum(tx.amount for tx in transactions), 2),
             "breakdown": breakdown,
+            "run_id": run.run_id,
+            "reused_existing_run": reused,
+            "superseded_run_id": previous.run_id if previous is not None and previous.run_id != run.run_id else None,
         }
 
-    def analyze_revenue(self, policy: PolicyLimits = DEFAULT_POLICY) -> Dict[str, Any]:
-        transactions = self.repo.get_all_transactions()
+    # ── analyze ──────────────────────────────────────────────────────────
+    @staticmethod
+    def _same_decision(a: Decision, b: Decision) -> bool:
+        return (
+            a.ai_proposed_action, a.final_action, a.policy_allowed, a.policy_reason,
+            a.ai_proposed_ev, a.ai_proposed_probability,
+        ) == (
+            b.ai_proposed_action, b.final_action, b.policy_allowed, b.policy_reason,
+            b.ai_proposed_ev, b.ai_proposed_probability,
+        )
+
+    def _record_decision(self, case: RecoveryCase, decision: Decision, reason: str, limits: PolicyLimits) -> None:
+        """
+        Persist a decision as the case's current one, move the case, audit it. Call inside atomic().
+        The limits the verdict was computed under are stored with it: policy can change later, and
+        the record must still show which numbers allowed or blocked the action.
+        """
+        now = utc_now_iso()
+        decision.run_id = case.run_id
+        decision.case_id = case.case_id
+        decision.policy_version = POLICY_VERSION
+        decision.policy_limits = limits.to_dict()
+        self.repo.save_decision(decision)
+
+        case.decision_id = decision.decision_id
+        case.authorized_action = decision.final_action
+        case.policy_version = POLICY_VERSION
+        case.authorization = {
+            "source": "decision",
+            "allowed": decision.policy_allowed,
+            "reason": decision.policy_reason,
+            "final_action": decision.final_action,
+            "ai_proposed_action": decision.ai_proposed_action,
+            "policy_version": POLICY_VERSION,
+            "evaluated_at": now,
+        }
+        case.blocked_reason = None if decision.policy_allowed else decision.policy_reason
+        case.safe_alternative = None if decision.policy_allowed else decision.final_action
+        desired = CaseState.AUTHORIZED if decision.policy_allowed else CaseState.BLOCKED
+        if case.state != desired:
+            case.transition(desired, reason, at=now)
+        else:
+            case.updated_at = now
+        self.repo.save_case(case)
+
+        if decision.policy_allowed:
+            self.audit_service.log_event(
+                merchant_id=case.merchant_id,
+                transaction_id=case.transaction_id,
+                leak_id=case.leak_id,
+                event_type=AuditEventType.DECISION_CREATED,
+                action=decision.final_action,
+                policy_result={"allowed": True, "reason": decision.policy_reason, "final_action": decision.final_action},
+                decision_id=decision.decision_id,
+                run_id=case.run_id,
+                case_id=case.case_id,
+            )
+        else:
+            self.audit_service.log_event(
+                merchant_id=case.merchant_id,
+                transaction_id=case.transaction_id,
+                leak_id=case.leak_id,
+                event_type=AuditEventType.ACTION_BLOCKED,
+                action=decision.ai_proposed_action,
+                policy_result={"allowed": False, "reason": decision.policy_reason, "final_action": decision.final_action},
+                decision_id=decision.decision_id,
+                run_id=case.run_id,
+                case_id=case.case_id,
+            )
+
+    def _decide_single_case(self, case: RecoveryCase) -> RecoveryCase:
+        """Decide one not-yet-analyzed case on demand (model inference runs outside the lock)."""
+        tx = self.repo.get_transaction_by_id(case.transaction_id, case.run_id)
+        prob = tx.model_recovery_prob
+        if prob is None:
+            prob = float(self._ensure_model().predict_proba(pd.DataFrame([tx.to_dict()]))[0])
+        with self.repo.atomic():
+            live = self.repo.get_case(case.case_id)
+            if live.decision_id:  # another request decided it first
+                return live
+            tx.model_recovery_prob = prob
+            self.repo.update_transaction_analysis(live.run_id, tx.transaction_id, prob, None)
+            facts = self.executor.policy_facts(tx, live)
+            decision = decide_intervention(facts, prob, self.policy, evaluator=evaluate_policy_strict)
+            self._record_decision(live, decision, "decision created on demand at execution request", self.policy)
+            return live
+
+    def analyze_revenue(self, policy: Optional[PolicyLimits] = None) -> Dict[str, Any]:
+        """
+        Score and decide every case in the active run. Idempotent: a case whose outcome is
+        already recorded keeps its decision, and a case whose fresh decision equals the
+        current one is left alone (no new decision id, no duplicate audit event). Decisions
+        are computed from the attempt ledger, not from the ingested counters alone.
+        """
+        policy = policy or self.policy
+        run = self.repo.get_active_run()
+        transactions = self.repo.get_all_transactions(run.run_id) if run else []
         if not transactions:
             raise ValueError("Call /api/scan first.")
 
@@ -114,44 +327,65 @@ class RecoveryService:
         df = pd.DataFrame(rows)
         probs = model.predict_proba(df)
 
-        contacts_today = defaultdict(int)
+        planned_contacts: Dict[str, int] = defaultdict(int)
         blocked_count = 0
-        action_counts = defaultdict(int)
+        action_counts: Dict[str, int] = defaultdict(int)
+        decisions: Dict[str, Decision] = {}
 
-        for i, tx in enumerate(transactions):
-            prob = float(probs[i])
-            tx.model_recovery_prob = prob
-            tx.contacts_today = contacts_today[tx.customer_id]
+        # Read once, in bulk, before taking any lock: the run's current decisions and attempt ledger, and the
+        # contact attempts inside the trailing window (any run). They are hints that save thousands of round
+        # trips; every case is re-checked under its row lock below, and execution never relies on them.
+        decisions_by_id = {d.decision_id: d for d in self.repo.get_all_decisions(run.run_id)}
+        ledger_by_case: Dict[str, list] = defaultdict(list)
+        for attempt in self.repo.list_attempts(run_id=run.run_id):
+            ledger_by_case[attempt.case_id].append(attempt)
+        contact_attempts: Dict[tuple, list] = defaultdict(list)
+        window_start = (self.executor.clock() - CONTACT_WINDOW).isoformat()
+        for attempt in self.repo.list_attempts_since(window_start):
+            if attempt.status in COUNTED_ATTEMPT_STATUSES and attempt.final_action in CUSTOMER_CONTACT_ACTIONS:
+                contact_attempts[(attempt.merchant_id, attempt.customer_id)].append(attempt)
 
-            decision = decide_intervention(tx.to_dict(), prob, policy)
-            self.repo.save_decision(decision)
+        for start in range(0, len(transactions), ANALYZE_CHUNK):
+            chunk = transactions[start:start + ANALYZE_CHUNK]
+            with self.repo.atomic():  # one unit of work (and one lock acquisition) per chunk of cases
+                locked = {c.transaction_id: c for c in self.repo.lock_cases(run.run_id, [t.transaction_id for t in chunk])}
+                score_rows = []
+                for offset, tx in enumerate(chunk):
+                    prob = float(probs[start + offset])
+                    tx.model_recovery_prob = prob
+                    case = locked[tx.transaction_id]
+                    current = None
+                    if case.decision_id:
+                        current = decisions_by_id.get(case.decision_id) or self.repo.get_decision(case.decision_id)
+                    if current is not None and case.state in FROZEN_CASE_STATES:
+                        decision = current  # outcome (or an in-flight attempt) already recorded
+                        score_rows.append((tx.transaction_id, prob, None))
+                    else:
+                        ledger = ledger_by_case.get(case.case_id, [])
+                        if sum(1 for a in ledger if a.status in COUNTED_ATTEMPT_STATUSES) != case.attempt_count:
+                            ledger = self.repo.list_attempts(case_id=case.case_id)  # an attempt landed after the bulk read
+                        facts = self.executor.policy_facts(
+                            tx, case,
+                            planned_contacts=planned_contacts[tx.customer_id],
+                            ledger=ledger,
+                            customer_attempts=contact_attempts.get((case.merchant_id, case.customer_id), []),
+                        )
+                        tx.contacts_today = facts["contacts_today"]  # decision-time view; policy re-reads the ledger at execution
+                        score_rows.append((tx.transaction_id, prob, tx.contacts_today))
+                        fresh = decide_intervention(facts, prob, policy, evaluator=evaluate_policy_strict)
+                        if current is not None and self._same_decision(current, fresh):
+                            decision = current
+                        else:
+                            decision = fresh
+                            self._record_decision(case, decision, "decision refreshed by analysis", policy)
+                        if decision.final_action in CUSTOMER_CONTACT_ACTIONS:
+                            planned_contacts[tx.customer_id] += 1
 
-            if decision.final_action in ("reminder", "payment_link"):
-                contacts_today[tx.customer_id] += 1
-
-            if not decision.policy_allowed:
-                blocked_count += 1
-                self.audit_service.log_event(
-                    merchant_id=tx.merchant_id,
-                    transaction_id=tx.transaction_id,
-                    leak_id=tx.leak_id,
-                    event_type=AuditEventType.ACTION_BLOCKED,
-                    action=decision.ai_proposed_action,
-                    policy_result={"allowed": False, "reason": decision.policy_reason, "final_action": decision.final_action},
-                    decision_id=decision.decision_id,
-                )
-            else:
-                self.audit_service.log_event(
-                    merchant_id=tx.merchant_id,
-                    transaction_id=tx.transaction_id,
-                    leak_id=tx.leak_id,
-                    event_type=AuditEventType.DECISION_CREATED,
-                    action=decision.final_action,
-                    policy_result={"allowed": True, "reason": decision.policy_reason, "final_action": decision.final_action},
-                    decision_id=decision.decision_id,
-                )
-
-            action_counts[decision.final_action] += 1
+                    decisions[tx.transaction_id] = decision
+                    if not decision.policy_allowed:
+                        blocked_count += 1
+                    action_counts[decision.final_action] += 1
+                self.repo.update_transaction_analyses(run.run_id, score_rows)
 
         self.repo.analyzed = True
 
@@ -160,7 +394,7 @@ class RecoveryService:
             sum(
                 tx.amount * (tx.model_recovery_prob or 0.0)
                 for tx in transactions
-                if self.repo.get_decision(tx.leak_id) and self.repo.get_decision(tx.leak_id).final_action != "suppress"
+                if decisions[tx.transaction_id].final_action != "suppress"
             ),
             2,
         )
@@ -183,8 +417,10 @@ class RecoveryService:
             "policy_blocked_count": blocked_count,
             "avg_recovery_probability": round(avg_prob, 4),
             "model_metadata": model.get_metadata(),
+            "run_id": run.run_id,
         }
 
+    # ── reads ────────────────────────────────────────────────────────────
     def get_transactions(self, limit: int = 100, leak_type: Optional[str] = None) -> List[Dict[str, Any]]:
         transactions = self.repo.get_all_transactions()
         if leak_type:
@@ -197,9 +433,13 @@ class RecoveryService:
 
     def get_opportunities(self, limit: int = 20) -> List[Dict[str, Any]]:
         transactions = self.repo.get_all_transactions()
+        # Two bulk reads rather than a case and a decision lookup per transaction.
+        cases_by_tx = {c.transaction_id: c for c in self.repo.list_cases()}
+        decisions_by_id = {d.decision_id: d for d in self.repo.get_all_decisions()}
         results = []
         for tx in transactions:
-            decision = self.repo.get_decision(tx.leak_id)
+            case = cases_by_tx.get(tx.transaction_id)
+            decision = decisions_by_id.get(case.decision_id) if case and case.decision_id else None
             if decision and decision.final_action not in ("suppress",):
                 prob = tx.model_recovery_prob or 0.0
                 expected_recovery = round(tx.amount * prob, 2)
@@ -214,6 +454,9 @@ class RecoveryService:
                     "recommended_action": decision.final_action,
                     "policy_allowed": decision.policy_allowed,
                     "policy_reason": decision.policy_reason,
+                    "run_id": tx.run_id,
+                    "case_id": case.case_id,
+                    "case_state": case.state.value,
                 })
         results.sort(key=lambda x: x["expected_recovery"], reverse=True)
         return results[:limit]
@@ -222,29 +465,80 @@ class RecoveryService:
         decision = self.repo.get_decision(key)
         return decision.to_dict() if decision else None
 
-    def get_interventions(self, limit: int = 100) -> List[Dict[str, Any]]:
-        interventions = self.repo.get_all_interventions()
+    def get_interventions(self, limit: int = 100, run_id: Optional[str] = None) -> List[Dict[str, Any]]:
+        interventions = self.repo.get_all_interventions(run_id)
         return [i.to_dict() for i in interventions[:limit]]
 
     def get_escalations(self, limit: int = 50) -> List[Dict[str, Any]]:
         escalations = self.repo.get_escalations()
         return [e.to_dict() for e in escalations[:limit]]
 
-    def get_analytics_summary(self) -> Dict[str, Any]:
+    def get_runs(self) -> List[Dict[str, Any]]:
+        return [r.to_dict() for r in self.repo.list_runs()]
+
+    def get_cases(self, limit: int = 100, state: Optional[str] = None, run_id: Optional[str] = None) -> List[Dict[str, Any]]:
+        cases = self.repo.list_cases(run_id)
+        if state:
+            cases = [c for c in cases if c.state.value == state]
+        return [c.to_dict() for c in cases[:limit]]
+
+    def get_case_detail(self, case_id: str) -> Optional[Dict[str, Any]]:
+        case = self.repo.get_case(case_id)
+        if case is None:
+            return None
+        detail = case.to_dict()
+        detail["attempts"] = [a.to_dict() for a in self.repo.list_attempts(case_id=case.case_id)]
+        return detail
+
+    # ── ledger-derived totals ────────────────────────────────────────────
+    def _ledger_totals(self) -> Dict[str, Any]:
+        """
+        Recovery figures for the active run, derived from the case and attempt ledgers:
+        one recovered amount per recovered case, regardless of how many requests,
+        replays or attempts touched it.
+        """
+        run = self.repo.get_active_run()
         transactions = self.repo.get_all_transactions()
-        total_at_risk = round(sum(tx.amount for tx in transactions), 2)
-        
-        interventions = self.repo.get_all_interventions()
-        total_recovered = sum(i.amount for i in interventions if i.recovered)
-        
-        recovered_count = sum(1 for i in interventions if i.recovered)
-        attempted_count = sum(1 for i in interventions if i.final_action in ("retry", "payment_link", "reminder"))
-        
-        decisions = self.repo.get_all_decisions() if hasattr(self.repo, 'get_all_decisions') else []
+        cases = self.repo.list_cases()
+        attempts = self.repo.list_attempts()
+
+        ran = [a for a in attempts if a.status in (AttemptStatus.COMPLETED, AttemptStatus.FAILED)]
+        recovery_attempts = [a for a in ran if a.final_action in RECOVERY_ACTIONS]
+        recovered_cases = [c for c in cases if c.state == CaseState.RECOVERED]
+        attempted_case_ids = {a.case_id for a in recovery_attempts}
+
+        actions: Dict[str, int] = {a: 0 for a in ("retry", "payment_link", "reminder", "escalate", "suppress")}
+        for a in ran:
+            if a.status == AttemptStatus.COMPLETED and a.final_action in actions:
+                actions[a.final_action] += 1
+
+        # An attempt must carry an allowed execution-time authorization for the action it ran.
+        violations = 0
+        for a in attempts:
+            if a.status == AttemptStatus.DENIED:
+                continue
+            auth = a.authorization or {}
+            if not (auth.get("allowed") is True and auth.get("final_action") == a.final_action):
+                violations += 1
+
+        return {
+            "run_id": run.run_id if run else None,
+            "total_at_risk": round(sum(tx.amount for tx in transactions), 2),
+            "total_recovered": round(sum(c.recovered_amount for c in recovered_cases), 2),
+            "recovered_count": len(recovered_cases),
+            "attempted_count": len(recovery_attempts),
+            "attempted_amount": round(sum(c.amount for c in cases if c.case_id in attempted_case_ids), 2),
+            "actions_executed": actions,
+            "policy_violations": violations,
+        }
+
+    def get_analytics_summary(self) -> Dict[str, Any]:
+        t = self._ledger_totals()
+        decisions = self.repo.get_all_decisions()
         blocked_count = sum(1 for d in decisions if not d.policy_allowed)
-        
-        escalations = self.repo.get_escalations()
-        escalation_count = len(escalations)
+        escalation_count = len(self.repo.get_escalations())
+        total_at_risk, total_recovered = t["total_at_risk"], t["total_recovered"]
+        recovered_count, attempted_count = t["recovered_count"], t["attempted_count"]
 
         return {
             "total_at_risk": total_at_risk,
@@ -254,95 +548,100 @@ class RecoveryService:
             "attempted_count": attempted_count,
             "intervention_success_rate_pct": round(100 * recovered_count / attempted_count, 2) if attempted_count else 0,
             "policy_blocked_count": blocked_count,
-            "escalation_count": escalation_count
+            "escalation_count": escalation_count,
+            "attempted_amount": t["attempted_amount"],
+            "run_id": t["run_id"],
+            "execution_mode": self.provider.execution_mode,
         }
 
+    # ── execution ────────────────────────────────────────────────────────
+    def execute_case(
+        self, target_id: str, idempotency_key: Optional[str] = None, expected_action: Optional[str] = None
+    ) -> ExecutionOutcome:
+        return self.executor.execute(target_id, idempotency_key, expected_action)
+
     def execute_individual_intervention(
-        self, target_id: str, idempotency_key: Optional[str] = None
+        self, target_id: str, idempotency_key: Optional[str] = None, expected_action: Optional[str] = None
     ) -> Dict[str, Any]:
-        # 1. Idempotency check
-        if idempotency_key:
-            existing = self.repo.get_intervention_by_idempotency_key(idempotency_key)
-            if existing:
-                return existing.to_dict()
-
-        # 2. Get transaction & decision
-        tx = self.repo.get_transaction_by_id(target_id)
-        if not tx:
-            raise ValueError(f"Transaction/leak ID {target_id} not found.")
-
-        decision = self.repo.get_decision(tx.leak_id)
-        if not decision:
-            model = self._ensure_model()
-            prob = float(model.predict_proba(pd.DataFrame([tx.to_dict()]))[0])
-            tx.model_recovery_prob = prob
-            decision = decide_intervention(tx.to_dict(), prob, DEFAULT_POLICY)
-            self.repo.save_decision(decision)
-
-        # 3. Execute intervention
-        intervention = self.provider.execute(tx.to_dict(), decision.to_dict(), idempotency_key)
-        self.repo.save_intervention(intervention)
-
-        # 4. Audit logging
-        event_type = (
-            AuditEventType.SUPPRESSION_CREATED if intervention.final_action == "suppress"
-            else AuditEventType.ESCALATION_CREATED if intervention.final_action == "escalate"
-            else AuditEventType.EXECUTION_SUCCEEDED if intervention.recovered
-            else AuditEventType.EXECUTION_FAILED
-        )
-
-        self.audit_service.log_event(
-            merchant_id=tx.merchant_id,
-            transaction_id=tx.transaction_id,
-            leak_id=tx.leak_id,
-            event_type=event_type,
-            action=intervention.final_action,
-            policy_result={"allowed": decision.policy_allowed, "reason": decision.policy_reason},
-            decision_id=decision.decision_id,
-            intervention_id=intervention.intervention_id,
-            outcome={"status": intervention.status, "recovered": intervention.recovered, "recovered_amount": intervention.recovered_amount},
-            idempotency_key=idempotency_key,
-        )
-
-        return intervention.to_dict()
+        return self.executor.execute(target_id, idempotency_key, expected_action).intervention
 
     def recover_revenue(self) -> Dict[str, Any]:
-        transactions = self.repo.get_all_transactions()
-        if not transactions:
+        """
+        Bulk recovery over the active run, through the same `ExecutionService.execute`
+        as a single request. Eligible = never attempted and currently authorized (or
+        blocked, whose executable action is the policy-sanctioned alternative). Cases
+        that already ran, are in flight, or have no decision are skipped, so calling it
+        twice executes nothing the second time. A failed attempt is never auto-retried
+        in bulk: that takes an explicit single request.
+        """
+        run = self.repo.get_active_run()
+        if run is None or not self.repo.get_all_transactions(run.run_id):
             raise ValueError("Call /api/analyze first.")
 
-        audit_log = []
-        for tx in transactions:
-            decision = self.repo.get_decision(tx.leak_id)
-            if not decision:
+        tally = {k: 0 for k in (
+            "executed", "recovered", "not_recovered", "suppressed", "escalated", "failed", "blocked", "skipped",
+        )}
+        for case in self.repo.list_cases(run.run_id):
+            eligible = (
+                case.state in (CaseState.AUTHORIZED, CaseState.BLOCKED)
+                and case.attempt_count == 0
+                and case.decision_id is not None
+            )
+            if not eligible:
+                tally["skipped"] += 1
                 continue
-            itv_dict = self.execute_individual_intervention(tx.transaction_id)
-            audit_log.append(itv_dict)
+            # Deterministic per (case, decision): a repeated bulk call replays a stored
+            # denial instead of writing a new one.
+            key = f"bulk:{case.case_id}:{case.decision_id}"
+            try:
+                outcome = self.executor.execute(case.case_id, key)
+            except (PolicyDenied, ReplayedExecutionError) as e:
+                tally["blocked" if e.code == PolicyDenied.code else "failed"] += 1
+                continue
+            except ProviderFailure:
+                tally["failed"] += 1
+                continue
+            except (CaseConflict, IdempotencyInProgress, StaleRun):
+                tally["skipped"] += 1
+                continue
+            if outcome.replayed:
+                tally["skipped"] += 1
+                continue
+            tally["executed"] += 1
+            status = outcome.intervention["status"]
+            key_for = {
+                "recovered": "recovered",
+                "attempted_no_recovery": "not_recovered",
+                "suppressed": "suppressed",
+                "escalated_to_merchant": "escalated",
+            }[status]
+            tally[key_for] += 1
 
         self.repo.recovered = True
 
-        total_recovered = sum(o["recovered_amount"] for o in audit_log)
-        total_at_risk = round(sum(tx.amount for tx in transactions), 2)
-        action_tally = pd.Series([o["final_action"] for o in audit_log]).value_counts().to_dict()
-        recovered_count = sum(1 for o in audit_log if o["recovered"])
-        attempted_count = sum(1 for o in audit_log if o["final_action"] in ("retry", "payment_link", "reminder"))
-
+        t = self._ledger_totals()
+        total_at_risk, total_recovered = t["total_at_risk"], t["total_recovered"]
+        recovered_count, attempted_count = t["recovered_count"], t["attempted_count"]
         return {
             "total_at_risk": total_at_risk,
-            "total_recovered": round(total_recovered, 2),
+            "total_recovered": total_recovered,
             "recovery_rate_pct": round(100 * total_recovered / total_at_risk, 2) if total_at_risk else 0,
-            "actions_executed": {
-                "retry": action_tally.get("retry", 0),
-                "payment_link": action_tally.get("payment_link", 0),
-                "reminder": action_tally.get("reminder", 0),
-                "escalate": action_tally.get("escalate", 0),
-                "suppress": action_tally.get("suppress", 0),
-            },
+            "actions_executed": t["actions_executed"],
             "recovered_count": recovered_count,
             "attempted_count": attempted_count,
             "avg_recovery_value": round(total_recovered / recovered_count, 2) if recovered_count else 0,
             "intervention_success_rate_pct": round(100 * recovered_count / attempted_count, 2) if attempted_count else 0,
-            "policy_violations": 0,
+            "policy_violations": t["policy_violations"],
+            "run_id": run.run_id,
+            "execution_mode": self.provider.execution_mode,
+            "executed_now": tally["executed"],
+            "recovered_now": tally["recovered"],
+            "not_recovered_now": tally["not_recovered"],
+            "suppressed_now": tally["suppressed"],
+            "escalated_now": tally["escalated"],
+            "failed_now": tally["failed"],
+            "blocked_now": tally["blocked"],
+            "skipped_now": tally["skipped"],
         }
 
     def simulate_policy(self, custom_policy: PolicyLimits) -> Dict[str, Any]:
@@ -361,7 +660,10 @@ class RecoveryService:
 
         for i, tx in enumerate(transactions):
             prob = float(probs[i])
-            dec = decide_intervention(tx.to_dict(), prob, custom_policy)
+            # Same rules as execution, so a record with a gap counts as blocked instead of crashing the simulation.
+            facts = tx.to_dict()
+            facts["hours_since_last_attempt"] = None
+            dec = decide_intervention(facts, prob, custom_policy, evaluator=evaluate_policy_strict)
             action_counts[dec.final_action] += 1
             if not dec.policy_allowed:
                 blocked_count += 1
@@ -383,14 +685,14 @@ class RecoveryService:
         if not txs:
             raise ValueError("Call /api/scan first.")
 
-        candidates = [tx for tx in txs if tx.leak_type == "failed_subscription" and tx.consecutive_failures >= 3]
+        candidates = [tx for tx in txs if tx.leak_type == "failed_subscription" and (tx.consecutive_failures or 0) >= 3]
         if not candidates:
-            candidates = [tx for tx in txs if tx.retries_so_far >= DEFAULT_POLICY.max_retries]
+            candidates = [tx for tx in txs if (tx.retries_so_far or 0) >= self.policy.max_retries]
         if not candidates:
             raise ValueError("No eligible leak found for demo force retry block beat.")
 
         tx = candidates[0]
-        policy_result = evaluate_policy(tx.to_dict(), Action.RETRY, DEFAULT_POLICY)
+        policy_result = evaluate_policy(tx.to_dict(), Action.RETRY, self.policy)
 
         return {
             "leak_id": tx.leak_id,
@@ -429,7 +731,7 @@ class RecoveryService:
                 f"Transaction {target_tx.transaction_id} is classified under leak type '{target_tx.leak_type.replace('_', ' ')}'. "
                 f"The predictive model computed a baseline recovery probability of {prob_pct} based on customer history "
                 f"({target_tx.prior_successful_payments} prior successful payments, {target_tx.retries_so_far} prior retries, "
-                f"{target_tx.hours_since_event:.1f}h elapsed). "
+                f"{'unknown' if target_tx.hours_since_event is None else format(target_tx.hours_since_event, '.1f')}h elapsed). "
             )
             if dec:
                 if dec.policy_allowed:
@@ -489,7 +791,7 @@ class RecoveryService:
             }
 
         total_amount = sum(t.amount for t in txs)
-        decisions = [self.repo.get_decision(t.leak_id) for t in txs if self.repo.get_decision(t.leak_id)]
+        decisions = self.repo.get_all_decisions()  # the current decision of each case in the active run
         blocked_decs = [d for d in decisions if d and not d.policy_allowed]
         interventions = self.repo.get_all_interventions()
         recovered_txs = [i for i in interventions if i.recovered]
@@ -524,7 +826,7 @@ class RecoveryService:
             recommendations = [
                 "Prioritize top opportunities with recovery probability > 70% for instant payment links.",
                 "Inspect the Escalations queue for high-value subscription accounts requiring white-glove follow-up.",
-                "Audit ledger maintains full cryptographic trace of all proposed vs executed interventions.",
+                "Audit log records every proposed vs executed intervention for this scan run (in-memory; cleared on restart).",
             ]
             guardrail_status = "Nominal — System Guardrails Active"
         elif "escalat" in q_lower:

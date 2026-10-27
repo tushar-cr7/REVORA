@@ -133,6 +133,20 @@ aesthetics, zebra-striped generic admin tables, 3D illustrations, confetti,
 emoji-as-UI. The full explicit ban list is in `UI_DESIGN.md` §9 and still
 applies.
 
+**Documented exception — Escalations hero:** the `/escalations` page's
+hero (`frontend/components/escalations/EscalationsHero.tsx`) uses a
+cropped image asset from an approved reference screenshot — a glass-card
+illustration with a warm amber glow — otherwise banned above. This was an
+explicit, deliberate product decision (2026-09-25) to give Escalations a
+distinct "human attention" visual identity, made knowingly against the
+general ban rather than by drift. It is scoped to that one component
+only; the glassmorphism/glow ban still applies everywhere else, including
+the rest of Escalations itself (KPI rail, queue table, case drawer all
+stay within the standard flat/restrained system). Don't treat this
+exception as license to reach for glassmorphism, glow, or static image
+assets elsewhere — it was granted once, for one hero, by explicit
+instruction.
+
 **Semantic color philosophy** (tokens defined in
 `frontend/tailwind.config.ts`, hex values match `UI_DESIGN.md` §1):
 
@@ -142,21 +156,57 @@ applies.
 | Recovered / success / satisfied control | `success-*` (emerald) | `#10B981` |
 | Risk / blocked / policy violation | `risk-*` (coral/red) | `#F5484F` |
 | Attention / paused / escalation | `warning-*` (amber) | `#F5A623` |
-| System / navigation / neutral data | `primary-*` (indigo/blue) | `#4F6EF7` |
+| System / navigation / neutral data | `primary-*` (blue) | `#4F7CFF` |
 
 A component gets **one** semantic accent color, chosen by which layer it
 belongs to. Violet is reserved for things that are literally AI-generated
 reasoning or recommendation — never used as decoration. This rule has held
 across every page rebuilt this project.
 
-Base surfaces are near-black navy, not pure black (`canvas` `#080B12`,
-`surface` `#0F141F`, `panel` `#131A26`) — see `tailwind.config.ts` for the
-full token set (borders, text, radii are also tokenized there).
+Base surfaces are neutral graphite, not blue-black and not pure black
+(`canvas` `#080A0D`, `surface` `#0D1117`, `panel` `#11161D`, `panel-raised`
+`#151B23`, borders `#252C36`) — see `tailwind.config.ts` for the full token
+set (borders, text, radii, shadows are also tokenized there). Blue is for
+actions, active/selected state and system signals only — never a surface or
+decoration colour. (Hex values in `UI_DESIGN.md` §1 predate this foundation;
+`tailwind.config.ts` wins.)
+
+**Global visual foundation** (`tailwind.config.ts` + `app/globals.css`,
+dashboard scope `.rv-app`): `tailwind.config.ts` is the single source of
+truth; `globals.css` reads it via `theme()`. The shared grammar is the `rv-*`
+classes — surfaces (`rv-surface`, `-raised`, `-focus`, `-critical`,
+`rv-well`, `rv-section`), financial data (`rv-amount`, `rv-id`, `rv-ts`,
+`rv-label`), the event language (`rv-kind` / `rv-node` driven by
+`data-kind`: event · signal · decision · policy · action · outcome ·
+escalation · override · block; labels and icons in
+`components/ui/eventKinds.tsx`), relationships (`rv-chain`, `rv-seq`,
+`rv-boundary`), controls (`rv-btn-*`, `rv-input`, `rv-tabs`, `rv-badge`) and
+`rv-table`. Extend these rather than hand-rolling a one-off per page. Every
+semantic scale has a full 100–900 ramp; don't use a shade that isn't defined
+there (undefined Tailwind shades silently render nothing).
+
+**Visual grammar primitives** (`frontend/components/grammar/`, vocabulary in
+`frontend/lib/grammar.ts`, CSS in the `rv-*` block of `globals.css`): React
+primitives for the questions every element should answer — is this money
+(`Amount`, `FinancialMetric`, `MonetaryDelta`; a vertical *tick* marks money,
+a *node* marks an event), an event (`EventRow`), a state (`StateIndicator`,
+`OutcomeIndicator`), intelligence vs authority (`LayerTag`, `LayerBlock`,
+`PolicyBoundary`, `DecisionState` — advisory layers are recessed/violet,
+binding layers raised/silver), a relationship (`TimelineConnector`,
+`Timeline`, `RecoveryFlow` — solid = reached, dashed = not, capped = halted at
+the boundary), or time (`Timestamp`, `RetryCount`, `TemporalToken`,
+`MetadataLine`). Compose these instead of hand-rolling a status chip, tone map
+or timeline per page. Verdicts/outcomes are read from backend fields via
+`decisionVerdict` / `outcomeFromStatus` — never recomputed. `rv-*` classes must
+appear as literal strings in TSX (Tailwind purges unseen ones). Unlinked
+specimen page: `/grammar` (static sample values, not live data).
 
 **Typography:** Geist Sans for UI text, Geist Mono for all currency
 figures, timestamps, transaction IDs, and percentages — this distinction
 is deliberate and load-bearing for the "infrastructure" feel; don't set a
-₹ amount in the sans typeface.
+₹ amount in the sans typeface. Geist is loaded from the `geist` package in
+`app/layout.tsx`; in the dashboard `font-display` resolves to Geist Sans
+(only the marketing layout maps it to a serif).
 
 **Brand/logo component:** `frontend/components/brand/RevoraLogo.tsx` is
 the single source-of-truth implementation. Raw logo/wordmark image assets
@@ -202,10 +252,13 @@ FastAPI app, single router, no duplicate business logic anywhere (see
 
 ```
 backend/app/
-├── main.py                 # FastAPI app entry, CORS, startup model load
-├── config.py                # Settings (PORT, CORS_ORIGINS, etc.)
+├── main.py                 # FastAPI app entry, CORS, startup model load + interrupted-execution sweep
+├── config.py                # Settings + REVORA_STORAGE / DATABASE_URL validation (refuses to guess)
+├── container.py             # Builds the repository the config names and the services on top of it
 ├── api/
-│   ├── routes.py            # All /api/* endpoints
+│   ├── runtime.py           # Process-wide container; server_error() keeps driver text out of responses
+│   ├── routes.py            # /api/* endpoints
+│   ├── ingestion_routes.py  # /api/ingest/* (Phase 2)
 │   └── schemas.py           # Pydantic request/response models
 ├── domain/
 │   ├── models.py            # Transaction, Decision, Intervention, AuditEvent, Action enum
@@ -218,10 +271,16 @@ backend/app/
 │   ├── base.py               # PaymentExecutionProvider interface
 │   └── simulation.py         # SimulationProvider — the only implementation today
 ├── repositories/
-│   ├── base.py                # Abstract repository interface
-│   └── in_memory.py           # InMemoryRepository — the only implementation today
+│   ├── base.py                # Abstract repository interface; atomic() = unit of work (read its docstring)
+│   ├── postgres.py            # PostgresRepository — the durable implementation (Phase 2)
+│   └── in_memory.py           # InMemoryRepository — explicit, NOT durable; unit tests and demos only
+├── db/                        # Bounded pool, SQL migration runner, migrations/0001 core, 0002 ingestion
+├── ingestion/                 # Normalized event contract, order-insensitive projection, adapter boundary
 └── services/
     ├── recovery_service.py   # Orchestrates scan → analyze → decide → execute → recover
+    ├── execution_service.py  # The one safe execution pathway (reserve / provider / complete / recover)
+    ├── ingestion_service.py  # Validate → store once → detect; replay
+    ├── detection_service.py  # The detection boundary: an obligation opens / refreshes / closes an inert case
     └── audit_service.py      # Structured audit log read/write
 ```
 
@@ -258,10 +317,29 @@ hardcoding these numbers.
 **Endpoints** (`backend/app/api/routes.py`, prefix `/api`):
 `GET /health` · `POST /scan` · `POST /analyze` · `GET /transactions` ·
 `GET /transactions/{id}` · `GET /opportunities` · `GET /decisions/{id}` ·
-`POST /interventions/{id}/execute` (`Idempotency-Key` header) ·
-`POST /recover` · `GET /interventions` · `GET /escalations` ·
-`GET /analytics` · `GET /audit` · `GET /policies` · `POST /simulate` ·
-`POST /demo/force-retry-block` · `POST /copilot/query`.
+`POST /interventions/{id}/execute` (`Idempotency-Key` header; optional
+`{"expected_action"}` body) · `POST /recover` · `GET /interventions` ·
+`GET /escalations` · `GET /analytics` · `GET /audit` · `GET /policies` ·
+`POST /simulate` · `POST /demo/force-retry-block` · `POST /copilot/query` ·
+`GET /runs` · `GET /cases` · `GET /cases/{id}` · `GET /health/ready` ·
+`POST /ingest/events` · `GET /ingest/events` · `GET /ingest/events/{id}` · `GET /ingest/obligations`.
+
+**Persistence and events (Phase 2 — read `docs/DURABLE_FOUNDATION.md` before touching storage, execution or
+ingestion).** The backend will not start unless `REVORA_STORAGE` is `postgres` (durable; needs `DATABASE_URL` and
+`python -m backend.app.db.migrate upgrade`) or `memory` (NOT durable). There is no fallback. On PostgreSQL a getter
+returns a *copy*: every mutation must be followed by its `save_*`. `atomic()` is a transaction that rolls back on an
+exception, so a refusal whose record must survive is *returned* from the unit of work and raised after it commits.
+Events are stored separately from the obligations derived from them; detection opens only **inert** cases in a
+per-merchant *ingestion run* that is never the active run (so they are not dashboard data and cannot be executed).
+`claimed_merchant_id` is an unauthenticated claim — never authorize on it.
+
+Recovery state is **case-based and run-scoped** — read
+`docs/RECOVERY_LIFECYCLE.md` before touching scan, analyze, execute or
+recover. In short: a scan creates (or, for identical source data,
+re-activates) a *run*; every transaction has one *recovery case* per run with
+an explicit state machine; every execution request goes through one pathway
+(`services/execution_service.py`) that re-checks policy against the attempt
+ledger, reserves an attempt atomically, then calls the provider.
 
 Important: **`GET /opportunities` does not exclude transactions that have
 already been executed** — it returns every decided, non-suppressed
@@ -271,12 +349,23 @@ real queue" itself by excluding transaction IDs already present in
 → `deriveQueue`). Don't assume the backend has already done this
 filtering.
 
-Also: **the same transaction can be executed more than once** — each call
-to `/interventions/{id}/execute` with a different idempotency key creates
-a new `Intervention` record. Frontend code that lists or sums
-interventions should dedupe to the most recent record per transaction
-(see `latestByTransaction` in the same file) to avoid double-counting
-recovered revenue or duplicate React keys.
+Also: **a case is executed at most once per authorization.** A second
+request with a new idempotency key is refused (`409`) once the case is
+`recovered` / `escalated` / `suppressed` or while an attempt is in flight; a
+case that ran without recovering (`attempted_no_recovery`) may get another
+attempt only if the policy engine authorizes it *now* (retry cap, cooldown and
+contact limits are read from the attempt ledger). The same key with the same
+request replays the original result; with a different target or action it is
+`422`. A transaction can therefore still have several `Intervention` records
+(one per counted attempt, never more than one recovered) — keep deduping to the
+latest per transaction (`latestByTransaction`) for display. Policy denials at
+execution are `409` with a plain-string `detail`, which the existing
+`fetchJson` wrapper already surfaces.
+
+Also: **transaction ids are only unique within a scan run** (the generator
+reuses `tx_fp_000000`… with different data for a different size/seed). The API
+resolves ids against the *active* run; `/interventions`, `/analytics` and
+`/audit` default to it as well (`?run_id=all` for history).
 
 ---
 
@@ -305,10 +394,21 @@ recovered revenue or duplicate React keys.
 ## 9. Current Implementation Status
 
 **Real and working today:**
-- FastAPI backend with the full pipeline above, 22 passing backend tests
-  (`pytest backend/tests`, spanning unit tests for the decision engine,
-  policy engine, and executor, plus integration tests for the API and
-  full pipeline).
+- FastAPI backend with the full pipeline above, 462 backend tests passing
+  (`REVORA_REQUIRE_POSTGRES=1 pytest backend/tests`, last run 2026-10-23 on
+  PostgreSQL 18.6 / Windows: 462 passed, 0 skipped). A green suite shows the
+  implemented behaviour and safeguards work as tested; it is **not** evidence of
+  production readiness (see §9 "Simulated, not real" and §17). The suite covers: unit tests for the decision engine, policy engine,
+  strict/fail-closed policy gate, case state machine, executor, storage
+  configuration, and the event contract/projection; integration tests for the
+  API, the full pipeline, the recovery lifecycle (attempt ledger, idempotency,
+  concurrency, scan-run isolation, bulk recovery) and — against a real
+  PostgreSQL — migrations, every schema constraint, the repository contract,
+  execution safety under multi-connection concurrency, interrupted-execution
+  recovery, event ingestion/detection, and real-OS-process restarts.
+  `backend/tests/tools/mutation_check.py` removes one safeguard at a time and
+  checks that a named test fails (results and the caveat on the obligation-insert
+  deadlock test: `docs/PHASE_2_CHECKPOINT.md`, `docs/DURABLE_FOUNDATION.md` §12).
 - A trained XGBoost model (`RecoveryModel`) actually producing
   `model_recovery_prob` per transaction — not a stub.
 - The deterministic policy engine actually blocking/downgrading/rerouting
@@ -316,7 +416,15 @@ recovered revenue or duplicate React keys.
   from real `evaluate_policy()` output.
 - Full Next.js dashboard with every route in §4 implemented and wired to
   real API data.
-- Idempotency-key support on intervention execution.
+- Idempotency on intervention execution: scoped by merchant + operation, bound to
+  a request fingerprint; the scope is a database primary key, so it holds across
+  processes on PostgreSQL (see `docs/RECOVERY_LIFECYCLE.md`, `docs/DURABLE_FOUNDATION.md`).
+- Recovery cases + attempt ledger + execution-time policy re-evaluation, durable
+  on PostgreSQL (in-memory only when `REVORA_STORAGE=memory` is chosen explicitly).
+- Event ingestion foundation: normalized events, dedup by source identity,
+  out-of-order-safe obligation projection, and a detection boundary opening/closing
+  *inert* cases (failed payment, failed subscription, overdue invoice). Verified
+  with synthetic fixtures only — **no real merchant data or provider is connected**.
 - Structured audit logging queryable via `/api/audit`.
 
 **Simulated, not real, today:**
@@ -337,12 +445,17 @@ recovered revenue or duplicate React keys.
   `AGENTS.md` §9. No `backend/app/ai/llm_client.py` or equivalent exists
   yet. Don't claim "Copilot uses Claude/GPT" in product copy — it doesn't,
   yet.
-- **Persistence**: `InMemoryRepository` only — all state (scanned
-  transactions, decisions, interventions, audit log) resets on backend
-  process restart. No `PostgresRepository` exists yet, despite
-  `DATABASE_URL` being present in `.env.example`. Don't claim persistent
-  storage in product copy.
-- **Auth**: none. Single-tenant demo mode.
+- **Persistence**: durable on PostgreSQL (`REVORA_STORAGE=postgres`), verified
+  against PostgreSQL 18.6 on Windows only. The audit log is stored but is
+  **not tamper-evident** (a trigger blocks accidental edits; nothing signs or
+  chains rows). With `REVORA_STORAGE=memory` everything resets on restart — the
+  `/api/health/ready` endpoint says which one is running. No backup/HA/retention
+  story exists. Don't claim production-grade or immutable storage in product copy.
+- **Event ingestion**: the endpoint and detection rules exist, but nothing real
+  feeds them; there is no provider adapter, no webhook authentication, and
+  event-derived cases cannot be decided or executed yet (see
+  `docs/DURABLE_FOUNDATION.md` §8). Don't claim live revenue-leak detection.
+- **Auth**: none. Single-tenant demo mode. Ingestion and execute endpoints are open.
 
 ---
 
@@ -359,6 +472,7 @@ one page's signature visual onto another.
 | **Recovery Brain** (`/recovery-brain`) | Decision intelligence | A "Decision Field": five lanes (one per recovery action) with transactions plotted by real confidence/value, a dormant→scanning→resolved state machine, and a Decision Detail panel (`components/recovery-brain/DecisionField.tsx` + `DecisionDetail.tsx`) |
 | **Transactions** (`/transactions`) | Forensic revenue ledger | A dense investigation table with a per-row risk signal rail, feeding a "Revenue Case" investigation drawer with a live signal path (Event → Leak → Signals → Recovery) (`components/transactions/TransactionLedger.tsx`, `SignalPath.tsx`, `components/drawer/TransactionDrawer.tsx`) |
 | **Interventions** (`/interventions`) | Operational action control | A real pipeline funnel (Decided → Ready → Executing → Completed) plus a three-lane action stream, feeding an "Action Control Center" drawer with Overview/Timeline/Transaction/Technical tabs (`components/interventions/ActionStream.tsx`, `InterventionDetail.tsx`) |
+| **Audit Trail** (`/audit`) | Flagship: the recovery ledger | A hairline "Event ledger" (business title first, event constant as metadata) beside a "Recovery record" for the selected transaction: money path (at risk → verdict → outcome) over a chronology of event → diagnosis → INTELLIGENCE recommends → authorization boundary → POLICY authorizes → SYSTEM executes → outcome (`components/audit/EventStream.tsx`, `CaseRecord.tsx`, `MoneyPath.tsx`). First full adoption of the visual grammar; below `xl` the record opens as a bottom sheet. |
 
 The shared icon mapping (`Sidebar.tsx`), one per destination: Revenue
 Command = `LayoutDashboard`, Revenue Scanner = `ScanLine`, Recovery Brain
@@ -586,16 +700,29 @@ the paired backup/RESTORE.md of each round):
 - **`/api/opportunities` includes already-executed transactions.** See
   §7 — the frontend, not the backend, is responsible for deriving the
   real "not yet executed" queue.
-- **A transaction can have multiple `Intervention` records.** See §7 —
-  always dedupe to the latest by timestamp before displaying or summing.
+- **A transaction can have multiple `Intervention` records.** See §7 — only
+  after a non-recovering attempt that policy allowed to be retried, never more
+  than one recovered. Still dedupe to the latest by timestamp for display.
+- **`/api/recover` figures are cumulative for the active run**, not per call; use
+  the `*_now` fields for this call. A failed case is never auto-retried in bulk.
 - **AI Copilot is not LLM-backed.** See §9 — don't extend it assuming an
   LLM call exists; it's template/string logic today.
-- **In-memory-only backend state.** A backend restart clears all scanned
-  transactions, decisions, interventions, and audit history. This is
-  expected in the current demo build, not a bug — but it means "current
-  data looks empty" after a backend restart is normal and just needs
-  `POST /scan` then `POST /analyze` to repopulate before testing a data
-  dependent page.
+- **Storage must be chosen.** The backend refuses to start without
+  `REVORA_STORAGE` (`postgres` or `memory`) and a migrated schema for
+  `postgres` (`python -m backend.app.db.migrate upgrade`). With `postgres`,
+  state survives restarts — "empty" data after a restart now means a
+  different database/schema, not normal behaviour. With `memory`, a restart
+  clears everything and `POST /scan` then `POST /analyze` repopulates it.
+- **PostgreSQL is slower than memory for bulk actions.** Measured locally: first
+  analysis of 10 000 cases ≈ 15 s (0.5 s in memory), bulk `/recover` ≈ 10 ms per
+  case. The dashboard only runs bulk recovery on 100 cases. See
+  `docs/DURABLE_FOUNDATION.md` §10 before assuming a page's loading time.
+- **The browser UI has not been tested against PostgreSQL storage.** Backend
+  tests, `tsc` and `npm run build` pass; no frontend file changed in Phase 2. On
+  2026-10-23 an HTTP-level smoke test (no browser) ran the real backend on
+  PostgreSQL plus the production-built frontend: scan/analyze/execute/ingest
+  worked, state was identical after a backend restart, and every dashboard route
+  returned 200. No page was rendered or clicked in a browser.
 - **`UI_DESIGN.md` §8 predates the mobile work** in §16 above and claims
   "below 768px: not a target for this hackathon." That's stale — several
   pages (Transactions, Interventions, Recovery Brain) now have verified,

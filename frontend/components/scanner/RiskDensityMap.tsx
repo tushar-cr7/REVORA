@@ -80,7 +80,7 @@ export const RiskDensityMap: React.FC<RiskDensityMapProps> = ({ scanData }) => {
                 {seg.dots.map((d, i) => (
                   <circle key={i} cx={d.x} cy={d.y} r={1.5} fill={seg.meta.color} opacity={active === seg.leak_type ? 0.95 : 0.65} />
                 ))}
-                {seg.w > 6 && <rect x={seg.x} y={0} width={1} height={VB_H} fill="#080B12" opacity={0.6} />}
+                {seg.w > 6 && <rect x={seg.x} y={0} width={1} height={VB_H} fill="#080A0D" opacity={0.6} />}
               </g>
             );
           })}

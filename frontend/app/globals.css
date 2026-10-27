@@ -2,56 +2,1580 @@
 @tailwind components;
 @tailwind utilities;
 
+/* ==========================================================================
+   REVORA — dark financial infrastructure
+   --------------------------------------------------------------------------
+   Every colour below is read from tailwind.config.ts via theme(); nothing is
+   declared twice. The reusable visual grammar lives in the `rv-*` classes at
+   the bottom of this file:
+
+     surfaces        rv-surface · -raised · -focus · -critical · rv-well · rv-section
+     financial data  rv-amount · rv-pct · rv-id · rv-ts · rv-label · rv-meta
+     event language  rv-kind · rv-node  (data-kind = event | signal | decision |
+                     policy | action | outcome | escalation | override | block)
+     relationships   rv-chain · rv-seq · rv-boundary
+     controls        rv-btn · rv-input · rv-tabs · rv-badge · rv-dot
+     data            rv-table · rv-metric
+
+   Visual grammar (money · state · authority · time · relationship) — what kind
+   of thing is this?
+     money           rv-tick · rv-fin · rv-delta · rv-amount        (data-fill, data-tone)
+     state           rv-state · rv-node[data-shape]                 (data-tone, data-kind)
+     authority       rv-layer · rv-gate · data-layer                (intelligence | policy | system | human)
+     event           rv-event                                       (data-kind; container-aware)
+     time            rv-ts · rv-temporal · rv-pips · rv-metaline
+     relationship    rv-link · rv-tl · rv-flow · rv-stage           (solid = reached, dashed = not,
+                                                                     capped = halted at the boundary)
+   React primitives for all of these live in components/grammar/.
+   ========================================================================== */
+
 :root {
-  --bg-canvas: #080B12;
-  --bg-surface: #0F141F;
-  --bg-panel: #131A26;
-  --bg-panel-raised: #171F2D;
-  --border-subtle: #1E2733;
-  --border-strong: #2A3646;
-  --text-primary: #F3F6FB;
-  --text-secondary: #A7B2C3;
-  --text-muted: #6C7789;
+  /* Surface ladder */
+  --bg-canvas: theme('colors.canvas');
+  --bg-surface: theme('colors.surface');
+  --bg-panel: theme('colors.panel.DEFAULT');
+  --bg-panel-raised: theme('colors.panel.raised');
+  --bg-panel-focus: theme('colors.panel.focus');
+  --border-subtle: theme('colors.border.subtle');
+  --border-strong: theme('colors.border.strong');
+  --border-divider: theme('colors.border.divider');
+  --text-primary: theme('colors.text.primary');
+  --text-secondary: theme('colors.text.secondary');
+  --text-muted: theme('colors.text.muted');
+
+  /* Fonts: Geist is attached to <html> in app/layout.tsx. */
+  --font-sans: var(--font-geist-sans);
+  --font-mono: var(--font-geist-mono);
+  /* Dashboard display type is Geist Sans. The marketing layout overrides this
+     on its own wrapper with its serif. */
+  --font-display: var(--font-geist-sans);
+
+  /* Chart primitives (for SVG / chart code to share one grid + axis language) */
+  --chart-grid: theme('colors.border.divider');
+  --chart-axis: theme('colors.text.muted');
 }
 
 body {
   background-color: var(--bg-canvas);
   color: var(--text-primary);
-  font-family: var(--font-sans, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif);
+  font-family: theme('fontFamily.sans');
   margin: 0;
   padding: 0;
   overflow-x: hidden;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
 }
 
-/* Custom Scrollbar for financial control room feel */
+/* Scrollbars: quiet, structural */
 ::-webkit-scrollbar {
-  width: 6px;
-  height: 6px;
+  width: 8px;
+  height: 8px;
 }
 ::-webkit-scrollbar-track {
-  background: #0B0E17;
+  background: theme('colors.canvas');
 }
 ::-webkit-scrollbar-thumb {
-  background: #1E2733;
-  border-radius: 3px;
+  background: theme('colors.border.subtle');
+  border-radius: 4px;
+  border: 2px solid theme('colors.canvas');
 }
 ::-webkit-scrollbar-thumb:hover {
-  background: #2A3646;
+  background: theme('colors.border.strong');
 }
 
-/* Tabular Number Formatting */
+/* Monospace is for identity and value, so it is always tabular with an
+   unambiguous zero. (Tailwind's `tabular-nums` utility still composes.) */
+.font-mono,
 .font-mono-numbers {
-  font-family: var(--font-mono, 'Geist Mono', 'IBM Plex Mono', monospace);
-  font-variant-numeric: tabular-nums;
+  font-variant-numeric: tabular-nums slashed-zero;
+  font-feature-settings: 'tnum' 1, 'zero' 1;
+}
+.font-mono-numbers {
+  font-family: var(--font-mono);
 }
 
-/* Subtle Panel Hover Accent */
+/* ----- Dashboard scope -------------------------------------------------- */
+
+.rv-app ::selection {
+  background: theme('colors.primary.500 / 38%');
+  color: theme('colors.text.primary');
+}
+.rv-app :focus-visible {
+  outline: 1px solid theme('colors.primary.400 / 85%');
+  outline-offset: 2px;
+}
+/* Display-sized figures in the dashboard are numbers first. */
+.rv-app .font-display {
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.02em;
+}
+
+/* `panel` is both a colour and a shadow token, so Tailwind recolours the
+   `shadow-panel` utility to the panel colour and the elevation vanishes.
+   Restore the intended top-edge light + contact shadow for existing consumers. */
+.shadow-panel {
+  box-shadow: theme('boxShadow.panel');
+}
+
+/* Subtle panel hover (kept for existing consumers) */
 .panel-interactive {
   transition: background-color 150ms ease-out, border-color 150ms ease-out;
 }
 .panel-interactive:hover {
-  background-color: #1A2333;
-  border-color: #2A3646;
+  background-color: theme('colors.panel.hover');
+  border-color: theme('colors.border.strong');
 }
+
+/* ==========================================================================
+   Page backdrop — architectural depth, subordinate to information.
+   A faint structural grid that fades out from the top edge, plus a restrained
+   overhead light. No colour, no motion, no blobs.
+   Parent must be `isolate` with an opaque canvas background.
+   ========================================================================== */
+.rv-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: -1;
+  pointer-events: none;
+  background:
+    radial-gradient(1100px 380px at 62% -160px, rgb(128 160 220 / 0.055), transparent 72%),
+    linear-gradient(to bottom, rgb(255 255 255 / 0.012), transparent 240px);
+}
+.rv-backdrop::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background-image:
+    linear-gradient(to right, rgb(255 255 255 / 0.024) 1px, transparent 1px),
+    linear-gradient(to bottom, rgb(255 255 255 / 0.024) 1px, transparent 1px);
+  background-size: 64px 64px;
+  background-position: -1px -1px;
+  -webkit-mask-image: radial-gradient(ellipse 85% 75% at 60% 0%, #000 0%, transparent 100%);
+  mask-image: radial-gradient(ellipse 85% 75% at 60% 0%, #000 0%, transparent 100%);
+}
+
+@layer components {
+  /* ======================================================================
+     SURFACES
+     L0 canvas (page)  →  L1 rv-surface  →  L2 rv-surface-raised
+     →  L3 rv-surface-focus  →  L4 rv-surface-critical.
+     Not everything is a card: rv-section and rv-well exist so information
+     can sit directly on the page or inset into a surface.
+     ====================================================================== */
+  .rv-surface {
+    background-color: theme('colors.panel.DEFAULT');
+    border: 1px solid theme('colors.border.subtle');
+    border-radius: theme('borderRadius.lg');
+    box-shadow: theme('boxShadow.panel');
+  }
+  .rv-surface-raised {
+    background-color: theme('colors.panel.raised');
+    border: 1px solid theme('colors.border.subtle');
+    border-radius: theme('borderRadius.lg');
+    box-shadow: theme('boxShadow.raised');
+  }
+  /* Focused / selected: a blue edge, not a blue glow. */
+  .rv-surface-focus {
+    background-color: theme('colors.panel.focus');
+    border: 1px solid theme('colors.primary.500 / 45%');
+    border-radius: theme('borderRadius.lg');
+    box-shadow: inset 2px 0 0 theme('colors.primary.500'), theme('boxShadow.raised');
+  }
+  /* Critical / attention: always a semantic tint (never neutral). */
+  .rv-surface-critical {
+    --tone: theme('colors.risk.400');
+    background-color: theme('colors.risk.muted');
+    border: 1px solid color-mix(in srgb, var(--tone) 30%, transparent);
+    border-radius: theme('borderRadius.lg');
+    box-shadow: inset 2px 0 0 var(--tone);
+  }
+  .rv-surface-critical[data-tone='warning'] {
+    --tone: theme('colors.warning.400');
+    background-color: theme('colors.warning.muted');
+  }
+  /* Inset well: data sitting inside a surface */
+  .rv-well {
+    background-color: theme('colors.surface');
+    border: 1px solid theme('colors.border.divider');
+    border-radius: theme('borderRadius.md');
+  }
+  /* Flush section: no card at all — hairline + spacing carry the grouping */
+  .rv-section {
+    border-top: 1px solid theme('colors.border.divider');
+    padding-top: 1rem;
+  }
+
+  /* ======================================================================
+     TYPE — financial data language
+     Numbers are the product. Mono + tabular + tight tracking, ₹ dimmed.
+     ====================================================================== */
+  .rv-amount {
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums slashed-zero;
+    font-feature-settings: 'tnum' 1, 'zero' 1;
+    font-weight: 600;
+    letter-spacing: -0.025em;
+    line-height: 1;
+    color: theme('colors.text.primary');
+  }
+  .rv-amount--sm { font-size: 14px; }
+  .rv-amount--md { font-size: 20px; }
+  .rv-amount--lg { font-size: 28px; }
+  .rv-amount--xl { font-size: 40px; letter-spacing: -0.035em; }
+  /* Optional ₹ wrapper: <span class="rv-cur">₹</span> */
+  .rv-cur {
+    color: theme('colors.text.muted');
+    font-weight: 500;
+    margin-right: 0.1em;
+  }
+  .rv-pct {
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+    font-weight: 500;
+    letter-spacing: -0.01em;
+  }
+  /* Transaction / entity identity */
+  .rv-id {
+    font-family: var(--font-mono);
+    font-feature-settings: 'zero' 1;
+    font-size: 11.5px;
+    font-weight: 500;
+    letter-spacing: 0;
+    color: theme('colors.text.secondary');
+  }
+  /* Timestamps */
+  .rv-ts {
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+    font-size: 10.5px;
+    letter-spacing: 0;
+    color: theme('colors.text.muted');
+    white-space: nowrap;
+  }
+  /* Eyebrow / field label */
+  .rv-label {
+    font-family: var(--font-mono);
+    font-size: 10px;
+    font-weight: 500;
+    line-height: 1.2;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: theme('colors.text.muted');
+  }
+  /* A label that continues as a hairline — section index in nav / panels */
+  .rv-label-rule {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+  .rv-label-rule::after {
+    content: '';
+    flex: 1;
+    height: 1px;
+    background: theme('colors.border.divider');
+  }
+  .rv-meta {
+    font-size: 11px;
+    line-height: 1.4;
+    color: theme('colors.text.muted');
+  }
+  .rv-title {
+    font-size: 22px;
+    font-weight: 600;
+    line-height: 1.15;
+    letter-spacing: -0.025em;
+    color: theme('colors.text.primary');
+  }
+  .rv-section-title {
+    font-size: 13px;
+    font-weight: 600;
+    line-height: 1.3;
+    letter-spacing: -0.005em;
+    color: theme('colors.text.primary');
+  }
+  .rv-subtitle {
+    font-size: 13px;
+    line-height: 1.5;
+    color: theme('colors.text.secondary');
+  }
+
+  /* ======================================================================
+     EVENT LANGUAGE
+     Nine system concepts, each distinguishable without reading the label:
+     colour (semantic) + silhouette (node) + type (mono caps).
+
+       event       neutral   ○ ring        something happened to money
+       signal      blue      ◆ diamond     evidence extracted from the event
+       decision    violet    ● disc        intelligence chose an action
+       policy      silver    ■ square      deterministic authorization boundary
+       action      blue      ▬ capsule     an intervention was executed
+       outcome     green     ◉ halo disc   measured result
+       escalation  amber     ▲ triangle    rerouted to a human
+       override    amber     ▢ dashed      a human changed the outcome
+       block       red       ◫ slashed     policy stopped the action
+     ====================================================================== */
+  /* A silhouette can also be requested directly with data-shape (ring · diamond ·
+     square · capsule · halo · triangle · dashed · slashed; default is the disc), so a
+     state that is not an event kind can still borrow one without borrowing its tone. */
+  .rv-node {
+    display: inline-block;
+    box-sizing: border-box;
+    flex: none;
+    width: 8px;
+    height: 8px;
+    border-radius: 999px;
+    background: var(--tone, theme('colors.text.secondary'));
+  }
+  :is(.rv-node[data-shape='ring'], .rv-node[data-kind='event'], [data-kind='event'] > .rv-node) {
+    background: transparent;
+    box-shadow: inset 0 0 0 1.5px var(--tone);
+  }
+  :is(.rv-node[data-shape='diamond'], .rv-node[data-kind='signal'], [data-kind='signal'] > .rv-node) {
+    border-radius: 1px;
+    transform: rotate(45deg) scale(0.78);
+  }
+  :is(.rv-node[data-shape='square'], .rv-node[data-kind='policy'], [data-kind='policy'] > .rv-node) {
+    border-radius: 1px;
+  }
+  :is(.rv-node[data-shape='capsule'], .rv-node[data-kind='action'], [data-kind='action'] > .rv-node) {
+    width: 12px;
+    height: 6px;
+    border-radius: 3px;
+  }
+  :is(.rv-node[data-shape='halo'], .rv-node[data-kind='outcome'], [data-kind='outcome'] > .rv-node) {
+    box-shadow: 0 0 0 3px color-mix(in srgb, var(--tone) 22%, transparent);
+  }
+  :is(.rv-node[data-shape='triangle'], .rv-node[data-kind='escalation'], [data-kind='escalation'] > .rv-node) {
+    border-radius: 0;
+    clip-path: polygon(50% 0, 100% 100%, 0 100%);
+  }
+  :is(.rv-node[data-shape='dashed'], .rv-node[data-kind='override'], [data-kind='override'] > .rv-node) {
+    border-radius: 1px;
+    background: transparent;
+    border: 1.5px dashed var(--tone);
+  }
+  :is(.rv-node[data-shape='slashed'], .rv-node[data-kind='block'], [data-kind='block'] > .rv-node) {
+    border-radius: 1px;
+    background: linear-gradient(to bottom, var(--tone) 0 36%, transparent 36% 64%, var(--tone) 64% 100%);
+  }
+
+  /* Kind chip: <span class="rv-kind" data-kind="policy"><i class="rv-node"/>Policy</span> */
+  .rv-kind {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    height: 20px;
+    padding: 0 7px 0 6px;
+    font-family: var(--font-mono);
+    font-size: 10px;
+    font-weight: 500;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    white-space: nowrap;
+    color: var(--tone, theme('colors.text.secondary'));
+    background: color-mix(in srgb, var(--tone, theme('colors.text.secondary')) 9%, transparent);
+    border: 1px solid color-mix(in srgb, var(--tone, theme('colors.text.secondary')) 24%, transparent);
+    border-radius: theme('borderRadius.sm');
+  }
+  /* Left rail in the kind's colour for rows / list items */
+  .rv-rail {
+    box-shadow: inset 2px 0 0 var(--tone, theme('colors.text.secondary'));
+  }
+
+  /* Badge (generic semantic status) and dot */
+  .rv-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    height: 18px;
+    padding: 0 6px;
+    font-size: 10.5px;
+    font-weight: 500;
+    letter-spacing: 0.01em;
+    white-space: nowrap;
+    color: var(--tone, theme('colors.text.secondary'));
+    background: color-mix(in srgb, var(--tone, theme('colors.text.secondary')) 10%, transparent);
+    border: 1px solid color-mix(in srgb, var(--tone, theme('colors.text.secondary')) 22%, transparent);
+    border-radius: theme('borderRadius.sm');
+  }
+  .rv-dot {
+    display: inline-block;
+    flex: none;
+    width: 6px;
+    height: 6px;
+    border-radius: 999px;
+    background: var(--tone, theme('colors.text.muted'));
+  }
+  .rv-dot[data-live] {
+    animation: rv-live 2.4s ease-in-out infinite;
+  }
+  @keyframes rv-live {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.35; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .rv-dot[data-live] { animation: none; }
+  }
+
+  /* ======================================================================
+     RELATIONSHIP LANGUAGE
+     transaction → intelligence → decision → policy → action → outcome.
+     Lines and nodes, with state: solid = reached, dashed = pending.
+     ====================================================================== */
+  /* Vertical chain. Children: .rv-chain-item > .rv-node + content. */
+  .rv-chain {
+    position: relative;
+    display: flex;
+    flex-direction: column;
+  }
+  .rv-chain-item {
+    position: relative;
+    padding: 0 0 16px 24px;
+  }
+  .rv-chain-item:last-child {
+    padding-bottom: 0;
+  }
+  .rv-chain-item > .rv-node {
+    position: absolute;
+    left: 0;
+    top: 5px;
+  }
+  .rv-chain-item::before {
+    content: '';
+    position: absolute;
+    left: 3.5px;
+    top: 18px;
+    bottom: -3px;
+    width: 1px;
+    background: theme('colors.border.strong');
+  }
+  .rv-chain-item:last-child::before {
+    display: none;
+  }
+  .rv-chain-item[data-state='pending']::before {
+    background: none;
+    border-left: 1px dashed theme('colors.border.strong');
+  }
+  .rv-chain-item[data-state='pending'] > .rv-node {
+    opacity: 0.45;
+  }
+
+  /* Horizontal sequence: node — link — node */
+  .rv-seq {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .rv-seq-link {
+    flex: 1;
+    min-width: 12px;
+    height: 1px;
+    background: linear-gradient(90deg, theme('colors.border.strong'), theme('colors.border.subtle'));
+  }
+  .rv-seq-link[data-state='pending'] {
+    background: repeating-linear-gradient(90deg, theme('colors.border.strong') 0 4px, transparent 4px 8px);
+  }
+
+  /* Authorization boundary: the line between what AI proposes and what is
+     allowed to happen. A dashed rule with a label. */
+  .rv-boundary {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    font-family: var(--font-mono);
+    font-size: 10px;
+    font-weight: 500;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: theme('colors.text.muted');
+  }
+  .rv-boundary::before,
+  .rv-boundary::after {
+    content: '';
+    flex: 1;
+    height: 1px;
+    background: repeating-linear-gradient(90deg, theme('colors.border.strong') 0 4px, transparent 4px 8px);
+  }
+
+  /* ======================================================================
+     FINANCIAL STATE
+     Money is marked with a vertical TICK — a ledger column — never a node, so a
+     figure and an event are different shapes at a glance. The fill says how
+     real the money is:
+       solid    real            at risk · recovered · escalated
+       outline  estimate / not money yet   potential · failed event
+       dashed   in flight or withheld      pending · suppressed
+       striped  prevented                  blocked
+     ====================================================================== */
+  .rv-amount--xs { font-size: 12px; font-weight: 500; letter-spacing: -0.01em; }
+
+  .rv-tick {
+    display: inline-block;
+    box-sizing: border-box;
+    flex: none;
+    width: 6px;
+    height: 13px;
+    border-radius: 1px;
+    background: var(--tone, theme('colors.text.secondary'));
+  }
+  .rv-tick[data-fill='outline'] {
+    background: transparent;
+    border: 1px solid var(--tone, theme('colors.text.secondary'));
+  }
+  .rv-tick[data-fill='dashed'] {
+    background: transparent;
+    border: 1px dashed var(--tone, theme('colors.text.secondary'));
+  }
+  .rv-tick[data-fill='striped'] {
+    border: 1px solid var(--tone, theme('colors.text.secondary'));
+    background: repeating-linear-gradient(
+      135deg,
+      var(--tone, theme('colors.text.secondary')) 0 1px,
+      transparent 1px 3px
+    );
+  }
+
+  /* Financial metric: LABEL → ₹ AMOUNT → CONTEXT. Scale comes from rv-amount--*. */
+  .rv-fin {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    min-width: 0;
+  }
+  .rv-fin-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    min-width: 0;
+  }
+  .rv-fin-label {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    min-width: 0;
+  }
+  .rv-fin-context {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    font-size: 11px;
+    line-height: 1.4;
+    color: theme('colors.text.muted');
+  }
+
+  /* One case's money as a path: at risk — verdict — where it ended up. */
+  .rv-path { container-type: inline-size; }
+  .rv-path-grid {
+    display: grid;
+    align-items: center;
+    column-gap: 8px;
+    grid-template-columns: minmax(0, 1.2fr) minmax(18px, 0.5fr) auto minmax(18px, 0.5fr) minmax(0, 1.2fr);
+  }
+  .rv-path-label { line-height: 1.25; overflow-wrap: anywhere; }
+  @container (max-width: 440px) {
+    .rv-path-amount { font-size: 20px; }
+    .rv-path-grid { grid-template-columns: minmax(0, 1fr) minmax(12px, 0.3fr) auto minmax(12px, 0.3fr) minmax(0, 1fr); column-gap: 6px; }
+  }
+
+  /* Signed monetary change: +₹31,400 recovered · −₹12,400 prevented */
+  .rv-delta {
+    display: inline-flex;
+    align-items: baseline;
+    gap: 1px;
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums slashed-zero;
+    font-feature-settings: 'tnum' 1, 'zero' 1;
+    font-size: 13px;
+    font-weight: 600;
+    letter-spacing: -0.01em;
+    white-space: nowrap;
+    color: var(--tone, theme('colors.text.primary'));
+  }
+  .rv-delta .rv-cur {
+    color: color-mix(in srgb, var(--tone, theme('colors.text.muted')) 60%, transparent);
+    margin-right: 0;
+  }
+
+  /* State read-out: node + MONO CAPS word. Inline by default; add rv-badge for a chip. */
+  .rv-state {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-family: var(--font-mono);
+    font-size: 10px;
+    font-weight: 500;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    white-space: nowrap;
+    color: var(--tone, theme('colors.text.secondary'));
+  }
+
+  /* ======================================================================
+     DECISION LANGUAGE — intelligence vs authority
+     Four layers, four verbs. AI recommends; rules authorize.
+
+       intelligence  ADVISORY  recessed, violet-tinted surface. It proposes.
+       policy        BINDING   raised, silver surface. It allows or blocks; its
+                               rail takes the verdict's colour.
+       system        ACTION    blue rail. It executes what policy authorized.
+       human         REVIEW    amber surface. A person looks at the result.
+
+     Recessed = advisory; raised = binding. The difference is structural, so it
+     survives without colour.
+     ====================================================================== */
+  .rv-layer {
+    --rail: var(--tone, theme('colors.text.secondary'));
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    min-width: 0;
+    padding: 12px 14px 12px 16px;
+    border: 1px solid theme('colors.border.subtle');
+    border-radius: theme('borderRadius.lg');
+    box-shadow: inset 2px 0 0 var(--rail);
+  }
+  .rv-layer[data-layer='intelligence'] {
+    background: theme('colors.ai.muted / 55%');
+    border-color: color-mix(in srgb, var(--tone) 22%, transparent);
+  }
+  .rv-layer[data-layer='policy'] {
+    background: theme('colors.panel.raised');
+    border-color: theme('colors.border.strong');
+    box-shadow: inset 2px 0 0 var(--rail), theme('boxShadow.raised');
+  }
+  .rv-layer[data-layer='policy'][data-verdict] {
+    --rail: var(--verdict);
+  }
+  .rv-layer[data-layer='system'] {
+    background: theme('colors.panel.DEFAULT');
+    border-color: color-mix(in srgb, var(--tone) 24%, transparent);
+  }
+  .rv-layer[data-layer='human'] {
+    background: theme('colors.warning.muted');
+    border-color: color-mix(in srgb, var(--tone) 28%, transparent);
+  }
+  /* Not reached (pending) or nothing happened (void): a dashed outline, no rail. */
+  .rv-layer[data-state='pending'],
+  .rv-layer[data-state='void'] {
+    background: transparent;
+    border-style: dashed;
+    border-color: theme('colors.border.strong');
+    box-shadow: none;
+  }
+  .rv-layer[data-state='pending'] { opacity: 0.6; }
+
+  .rv-layer-head {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: 6px 12px;
+  }
+  .rv-layer-lead {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    min-width: 0;
+  }
+  /* The layer's verb: "recommends", "authorizes", "executes", "decides" */
+  .rv-layer-verb {
+    font-family: var(--font-mono);
+    font-size: 10px;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: theme('colors.text.muted');
+  }
+  .rv-layer-statement {
+    font-size: 13.5px;
+    font-weight: 500;
+    line-height: 1.35;
+    letter-spacing: -0.005em;
+    color: theme('colors.text.primary');
+  }
+  .rv-layer-detail {
+    font-size: 12px;
+    line-height: 1.5;
+    color: theme('colors.text.secondary');
+  }
+
+  /* Authorization boundary: a control boundary, not a divider. It carries the
+     verdict. Solid rules (the boundary is firm — dashes mean "not yet" elsewhere),
+     a plate in the verdict's colour, and the two sides of the claim. The wrapper
+     measures itself; the row inside it lays out inline when wide, and tucks the
+     two sides of the claim under their rules when narrow — never hides them. */
+  .rv-gate {
+    container-type: inline-size;
+    min-width: 0;
+  }
+  .rv-gate-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    min-width: 0;
+    font-family: var(--font-mono);
+    font-size: 10px;
+    font-weight: 500;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: theme('colors.text.muted');
+  }
+  .rv-gate-line {
+    flex: 1;
+    min-width: 8px;
+    height: 1px;
+    background: theme('colors.border.strong');
+  }
+  .rv-gate-side {
+    flex: none;
+    white-space: nowrap;
+  }
+  .rv-gate-plate {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    flex: none;
+    height: 22px;
+    padding: 0 9px 0 8px;
+    white-space: nowrap;
+    color: var(--verdict, theme('colors.text.secondary'));
+    background: color-mix(in srgb, var(--verdict, theme('colors.text.secondary')) 8%, theme('colors.surface'));
+    border: 1px solid color-mix(in srgb, var(--verdict, theme('colors.text.secondary')) 38%, transparent);
+    border-radius: theme('borderRadius.sm');
+  }
+  .rv-gate-plate .rv-node {
+    --tone: var(--verdict, theme('colors.text.secondary'));
+  }
+  .rv-gate-plate-label {
+    color: theme('colors.text.secondary');
+  }
+  @container (max-width: 480px) {
+    .rv-gate-row {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
+      row-gap: 7px;
+    }
+    .rv-gate-row > :nth-child(1) { grid-column: 1; grid-row: 2; }
+    .rv-gate-row > :nth-child(2) { grid-column: 1; grid-row: 1; }
+    .rv-gate-row > :nth-child(3) { grid-column: 2; grid-row: 1; }
+    .rv-gate-row > :nth-child(4) { grid-column: 3; grid-row: 1; }
+    .rv-gate-row > :nth-child(5) { grid-column: 3; grid-row: 2; justify-self: end; }
+  }
+  @container (max-width: 290px) {
+    .rv-gate-plate-label { display: none; }
+  }
+
+  /* ======================================================================
+     RELATIONSHIP LANGUAGE — links
+     A link is a real dependency: this led to that.
+       reached   solid line      the flow got here
+       pending   dashed line     the flow has not got here
+       halted    dashed + a stop cap at its START: the flow ended at the
+                 boundary and never crossed it (policy withheld or rerouted it)
+     ====================================================================== */
+  .rv-link {
+    position: relative;
+    flex: none;
+    background: theme('colors.border.strong');
+  }
+  .rv-link[data-orient='v'] { width: 1px; min-height: 14px; }
+  .rv-link[data-orient='h'] { height: 1px; min-width: 14px; flex: 1; }
+  .rv-link[data-state='pending'],
+  .rv-link[data-state='halted'] {
+    background: none;
+  }
+  .rv-link[data-state='pending'][data-orient='v'],
+  .rv-link[data-state='halted'][data-orient='v'] {
+    background: repeating-linear-gradient(to bottom, theme('colors.border.strong') 0 4px, transparent 4px 8px);
+  }
+  .rv-link[data-state='pending'][data-orient='h'],
+  .rv-link[data-state='halted'][data-orient='h'] {
+    background: repeating-linear-gradient(to right, theme('colors.border.strong') 0 4px, transparent 4px 8px);
+  }
+  .rv-link[data-state='halted'] {
+    --tone: theme('colors.risk.400');
+  }
+  .rv-link[data-state='halted']::before {
+    content: '';
+    position: absolute;
+    background: var(--tone);
+  }
+  .rv-link[data-state='halted'][data-orient='v']::before {
+    top: 0;
+    left: 50%;
+    width: 11px;
+    height: 2px;
+    transform: translate(-50%, -1px);
+  }
+  .rv-link[data-state='halted'][data-orient='h']::before {
+    left: 0;
+    top: 50%;
+    width: 2px;
+    height: 11px;
+    transform: translate(-1px, -50%);
+  }
+
+  /* Vertical timeline: time gutter · rail (node + link) · content */
+  .rv-tl { display: flex; flex-direction: column; }
+  .rv-tl-item {
+    display: grid;
+    grid-template-columns: 4.5rem 12px minmax(0, 1fr);
+    column-gap: 12px;
+  }
+  .rv-tl-time {
+    padding-top: 1px;
+    text-align: right;
+  }
+  .rv-tl-rail {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+  }
+  .rv-tl-rail > .rv-node { margin-top: 4px; }
+  .rv-tl-rail > .rv-link {
+    flex: 1;
+    margin: 4px 0 -1px;
+  }
+  .rv-tl-body {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    min-width: 0;
+    padding-bottom: 16px;
+  }
+  .rv-tl-item:last-child .rv-tl-body { padding-bottom: 0; }
+  .rv-tl-item:last-child .rv-tl-rail > .rv-link { display: none; }
+  .rv-tl-title {
+    font-size: 13px;
+    font-weight: 500;
+    line-height: 1.35;
+    color: theme('colors.text.primary');
+  }
+  .rv-tl-item[data-state='pending'] .rv-tl-title { color: theme('colors.text.muted'); }
+  .rv-tl-item[data-state='pending'] .rv-node { opacity: 0.4; }
+
+  /* Horizontal flow: DETECT → DIAGNOSE → DECIDE ┃ ACT → OUTCOME */
+  .rv-flow {
+    display: flex;
+    align-items: flex-start;
+    gap: 0;
+    min-width: 0;
+    overflow-x: auto;
+  }
+  .rv-flow > .rv-link { margin-top: 6px; align-self: flex-start; }
+  .rv-stage {
+    display: flex;
+    flex: none;
+    flex-direction: column;
+    gap: 6px;
+    min-width: 0;
+  }
+  .rv-stage-mark {
+    display: flex;
+    align-items: center;
+    height: 12px;
+  }
+  .rv-stage-label {
+    font-family: var(--font-mono);
+    font-size: 10px;
+    font-weight: 500;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: theme('colors.text.secondary');
+  }
+  .rv-stage-value {
+    font-size: 11px;
+    line-height: 1.3;
+    color: theme('colors.text.muted');
+  }
+  .rv-stage[data-state='active'] .rv-stage-label { color: theme('colors.text.primary'); }
+  .rv-stage[data-state='active'] .rv-node:not([data-kind='outcome']) {
+    box-shadow: 0 0 0 3px color-mix(in srgb, var(--tone) 22%, transparent);
+  }
+  .rv-stage[data-state='pending'] .rv-stage-label { color: theme('colors.text.muted'); }
+  .rv-stage[data-state='pending'] .rv-node { opacity: 0.4; }
+  .rv-stage[data-state='halted'] .rv-stage-label { color: var(--tone); }
+  .rv-stage-verdict {
+    font-family: var(--font-mono);
+    font-size: 10px;
+    font-weight: 500;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--verdict, theme('colors.text.secondary'));
+  }
+  /* The policy gate inside a flow: a bar across the path, not a stage on it */
+  .rv-gatemark {
+    display: block;
+    width: 2px;
+    height: 16px;
+    margin: -2px 0;
+    border-radius: 1px;
+    background: var(--verdict, theme('colors.text.secondary'));
+  }
+
+  /* ======================================================================
+     EVENT ROW — financial-infrastructure / observability, not a marketing card.
+     TYPE · SUBJECT · TIME · AMOUNT · STATE. The row measures its own width (not
+     the viewport), so it is correct in a page, a drawer or a bottom sheet.
+     ====================================================================== */
+  .rv-event {
+    container-type: inline-size;
+    position: relative;
+    padding: 9px 14px 9px 12px;
+    border-bottom: 1px solid theme('colors.border.divider');
+    transition: background-color 100ms ease-out;
+  }
+  .rv-event:last-child { border-bottom: 0; }
+  .rv-event[data-interactive] { cursor: pointer; }
+  .rv-event[data-interactive]:hover { background: theme('colors.panel.hover / 55%'); }
+  .rv-event[data-selected] {
+    background: theme('colors.panel.focus');
+    box-shadow: inset 2px 0 0 theme('colors.primary.500');
+  }
+  .rv-event-body {
+    display: grid;
+    align-items: center;
+    column-gap: 14px;
+    row-gap: 6px;
+    grid-template-columns: 13rem minmax(0, 1fr) 4.5rem 5.5rem 7.5rem;
+    grid-template-areas: 'type subject time amount state';
+  }
+  .rv-event-type {
+    grid-area: type;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    min-width: 0;
+  }
+  .rv-event-name {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    font-weight: 500;
+    letter-spacing: 0.04em;
+    color: theme('colors.text.primary');
+  }
+  .rv-event-subject {
+    grid-area: subject;
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 3px;
+    min-width: 0;
+  }
+  .rv-event-entity {
+    display: inline-flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 2px 8px;
+    min-width: 0;
+  }
+  .rv-event-reason {
+    max-width: 100%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: 11.5px;
+    color: theme('colors.text.muted');
+  }
+  .rv-event-time { grid-area: time; }
+  .rv-event-amount { grid-area: amount; justify-self: end; }
+  .rv-event-state { grid-area: state; }
+  /* Mid width: two rows — what happened and when/how much, then which case and where it stands. */
+  @container (max-width: 760px) {
+    .rv-event-state { align-items: flex-end; text-align: right; }
+    .rv-event-body {
+      grid-template-columns: minmax(0, 1fr) minmax(4.5rem, auto) 7rem;
+      grid-template-areas:
+        'type    time    amount'
+        'subject subject state';
+    }
+  }
+  /* Narrow: one column of three rows. */
+  @container (max-width: 480px) {
+    .rv-event-body {
+      grid-template-columns: minmax(0, 1fr) auto;
+      grid-template-areas:
+        'type    amount'
+        'subject subject'
+        'time    state';
+    }
+  }
+
+  /* Titled event row: a business-language title leads, the event constant steps
+     back to technical metadata beneath it, and the state can say what happens next. */
+  .rv-event-type[data-titled] { align-items: flex-start; }
+  .rv-event-type[data-titled] > .rv-node { margin-top: 5px; }
+  .rv-event-heading {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    min-width: 0;
+  }
+  .rv-event-title {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: 13px;
+    font-weight: 500;
+    line-height: 1.3;
+    letter-spacing: -0.005em;
+    color: theme('colors.text.primary');
+  }
+  .rv-event-code {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-family: var(--font-mono);
+    font-size: 10px;
+    letter-spacing: 0.04em;
+    color: theme('colors.text.muted');
+  }
+  .rv-event-state {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 2px;
+    min-width: 0;
+  }
+  .rv-event-next {
+    max-width: 100%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: 10.5px;
+    line-height: 1.3;
+    color: theme('colors.text.muted');
+  }
+  /* Titled rows read business event → context → technical metadata: the title and its
+     one-line context lead; the case reference and the event constant sit in the subject
+     column as metadata. */
+  .rv-event-context {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: 11.5px;
+    line-height: 1.4;
+    color: theme('colors.text.muted');
+  }
+  /* The context needs room, so a titled row gives the first column the slack. Scoped to
+     the wide layout; the narrower container layouts above keep their own templates. */
+  @container (min-width: 761px) {
+    .rv-event-body[data-titled] {
+      grid-template-columns: minmax(0, 1fr) 13rem 4.5rem 5.5rem 7.5rem;
+    }
+  }
+
+  /* A ledger: rows under one column header. The header only exists while the
+     rows are wide enough to be columns. */
+  .rv-ledger { container-type: inline-size; }
+  .rv-event-head {
+    padding: 8px 14px 8px 12px;
+    border-bottom: 1px solid theme('colors.border.subtle');
+  }
+  .rv-event-head .rv-event-body { row-gap: 0; }
+  @container (max-width: 760px) {
+    .rv-event-head { display: none; }
+  }
+
+  /* Timeline rows whose body is a surface, and the row the viewer arrived from */
+  .rv-tl-item[data-block] .rv-tl-rail > .rv-node { margin-top: 17px; }
+  .rv-tl-item[data-block] .rv-tl-time { padding-top: 14px; }
+  .rv-tl-item[data-focus] .rv-tl-rail > .rv-node:not([data-kind='outcome']) {
+    box-shadow: 0 0 0 3px color-mix(in srgb, var(--tone) 28%, transparent);
+  }
+  .rv-tl-item[data-focus] .rv-tl-time { color: theme('colors.text.secondary'); }
+
+  /* Controls in play: one line per recovery control the policy engine applies */
+  .rv-checks {
+    display: flex;
+    flex-direction: column;
+    margin-top: 2px;
+    border-top: 1px solid theme('colors.border.divider');
+  }
+  .rv-check {
+    display: grid;
+    grid-template-columns: 8px minmax(0, 1fr) auto;
+    align-items: start;
+    gap: 10px;
+    padding: 8px 0;
+    border-bottom: 1px solid theme('colors.border.divider');
+  }
+  .rv-check:last-child { border-bottom: 0; padding-bottom: 0; }
+  .rv-check > .rv-node { margin-top: 4px; }
+  .rv-check-label {
+    font-size: 12px;
+    line-height: 1.35;
+    color: theme('colors.text.primary');
+  }
+  .rv-check-detail {
+    font-size: 11px;
+    line-height: 1.4;
+    color: theme('colors.text.muted');
+  }
+
+  /* Options considered: the chosen action and the alternatives it beat */
+  .rv-option {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 3.5rem 4.5rem;
+    align-items: baseline;
+    gap: 12px;
+    padding: 6px 0;
+    font-size: 12px;
+    color: theme('colors.text.secondary');
+    border-bottom: 1px solid theme('colors.border.divider');
+  }
+  .rv-option:last-child { border-bottom: 0; }
+  .rv-option[data-chosen] { color: theme('colors.text.primary'); }
+  .rv-option-figure {
+    text-align: right;
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums slashed-zero;
+    font-size: 11.5px;
+  }
+
+  /* ======================================================================
+     RECOVERY STORY — one operational chain, not five KPIs.
+     Each stage is one counted thing, set the same way: LABEL (what is counted) →
+     FIGURE → WHO produced it → what it MEANS. Money stages wear a tick; counted
+     stages wear the silhouette of the layer that produced them, so the actor is
+     never mistaken for the metric. A split stage divides the one before it
+     (700 recommendations → 539 authorized + 161 stopped).
+     The strip measures its own width:
+       ≥ 900px  five columns, left to right
+       ≥ 520px  one row per stage, top to bottom
+       below    stacked, beneath a rail
+     ====================================================================== */
+  .rv-story { container-type: inline-size; }
+  .rv-story-flow {
+    display: flex;
+    flex-direction: column;
+    margin: 0;
+    padding: 0;
+    list-style: none;
+  }
+  .rv-story-stage {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-areas:
+      'head'
+      'figure'
+      'note';
+    row-gap: 6px;
+    min-width: 0;
+  }
+  .rv-story-head {
+    grid-area: head;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-width: 0;
+    min-height: 20px;
+  }
+  .rv-story-figure { grid-area: figure; min-width: 0; padding-left: 16px; }
+  /* What the stage means: who produced it (when something acted), then one plain sentence. */
+  .rv-story-note {
+    grid-area: note;
+    min-width: 0;
+    padding-left: 16px;
+    font-size: 11px;
+    line-height: 1.4;
+    color: theme('colors.text.muted');
+  }
+  .rv-story-who { display: block; margin-bottom: 2px; }
+  .rv-story-actor {
+    font-family: var(--font-mono);
+    font-size: 10px;
+    font-weight: 500;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--tone, theme('colors.text.secondary'));
+  }
+  .rv-story-figure .rv-amount { font-size: 22px; }
+  .rv-story-split {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: flex-start;
+    gap: 6px 18px;
+  }
+  .rv-story-count { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+
+  /* The link between two stages: a rail when stacked, a hairline when in a row. */
+  .rv-story-link {
+    display: flex;
+    height: 18px;
+    padding-left: 3px;
+  }
+  .rv-story-h { display: none; }
+
+  @container (min-width: 520px) {
+    .rv-story-stage {
+      grid-template-columns: 12rem minmax(0, 1fr);
+      grid-template-areas:
+        'head   note'
+        'figure note';
+      column-gap: 24px;
+      align-items: start;
+    }
+    .rv-story-note { padding-left: 0; }
+  }
+  @container (min-width: 900px) {
+    .rv-story-flow {
+      display: grid;
+      align-items: start;
+      column-gap: 12px;
+      grid-template-columns: minmax(0, 1fr) 20px minmax(0, 1fr) 20px minmax(0, 1.3fr) 20px minmax(0, 1fr) 20px minmax(0, 1.15fr);
+    }
+    .rv-story-stage {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+    .rv-story-figure,
+    .rv-story-note { padding-left: 0; }
+    .rv-story-figure .rv-amount { font-size: 26px; }
+    .rv-story-link { height: auto; padding: 10px 0 0; }
+    .rv-story-h { display: block; }
+    .rv-story-v { display: none; }
+  }
+
+  /* A partition: one bar split in proportion to the counts it divides. */
+  .rv-split {
+    display: flex;
+    gap: 2px;
+    height: 4px;
+    max-width: 14rem;
+    margin-top: 10px;
+  }
+  .rv-split[data-wide] { max-width: none; }
+  .rv-split-seg {
+    flex-basis: 0;
+    min-width: 3px;
+    border-radius: 1px;
+    background: var(--tone, theme('colors.text.secondary'));
+    opacity: 0.75;
+  }
+
+  /* ======================================================================
+     TEMPORAL + METADATA
+     Time is first-class: precise clock, retry count, cooldown, age. Mono only
+     for IDs, clocks and system values.
+     ====================================================================== */
+  .rv-temporal {
+    display: inline-flex;
+    align-items: baseline;
+    gap: 6px;
+    font-family: var(--font-mono);
+    font-size: 10.5px;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    white-space: nowrap;
+    color: theme('colors.text.muted');
+  }
+  .rv-temporal-value {
+    font-variant-numeric: tabular-nums slashed-zero;
+    font-weight: 500;
+    color: theme('colors.text.primary');
+  }
+  .rv-temporal[data-tone]:not([data-tone='neutral']) .rv-temporal-value {
+    color: var(--tone);
+  }
+  .rv-ts-rel {
+    font-size: 11px;
+    color: theme('colors.text.muted');
+  }
+  .rv-pips {
+    display: inline-flex;
+    align-items: center;
+    gap: 3px;
+  }
+  .rv-pip {
+    width: 6px;
+    height: 6px;
+    box-sizing: border-box;
+    border: 1px solid theme('colors.border.strong');
+    border-radius: 1px;
+  }
+  .rv-pip[data-on] {
+    background: var(--tone, theme('colors.text.secondary'));
+    border-color: var(--tone, theme('colors.text.secondary'));
+  }
+
+  /* Metadata line: LABEL value │ LABEL value — hairline-separated, wraps cleanly */
+  .rv-metaline {
+    min-width: 0;
+    overflow: hidden;
+    font-size: 11px;
+    line-height: 1.4;
+    color: theme('colors.text.muted');
+  }
+  /* Each item carries its own leading hairline; the row is pulled left by that
+     amount and clipped by .rv-metaline, so the first item on every wrapped line
+     starts clean instead of with an orphaned separator. */
+  .rv-metaline-row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 3px 0;
+    margin-left: -11px;
+  }
+  .rv-metaline-item {
+    display: inline-flex;
+    align-items: baseline;
+    gap: 6px;
+    min-width: 0;
+    padding-left: 10px;
+    border-left: 1px solid theme('colors.border.strong');
+    margin-right: 10px;
+  }
+  .rv-metaline-label {
+    font-family: var(--font-mono);
+    font-size: 9.5px;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: theme('colors.text.muted');
+  }
+  .rv-metaline-value[data-mono] {
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums slashed-zero;
+    font-size: 11px;
+    color: theme('colors.text.secondary');
+  }
+
+  /* ======================================================================
+     CONTROLS
+     primary (blue, the one action) · secondary · danger · system · ghost
+     ====================================================================== */
+  .rv-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    height: 32px;
+    padding: 0 12px;
+    font-size: 13px;
+    font-weight: 500;
+    line-height: 1;
+    letter-spacing: -0.005em;
+    white-space: nowrap;
+    cursor: pointer;
+    color: theme('colors.text.primary');
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: theme('borderRadius.md');
+    transition: background-color 120ms ease-out, border-color 120ms ease-out, color 120ms ease-out;
+  }
+  .rv-btn:disabled,
+  .rv-btn[aria-disabled='true'] {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+  .rv-btn-primary {
+    background: theme('colors.primary.600');
+    border-color: theme('colors.primary.500');
+    color: #fff;
+    box-shadow: inset 0 1px 0 rgb(255 255 255 / 0.14);
+  }
+  .rv-btn-primary:hover:not(:disabled) { background: theme('colors.primary.500'); }
+  .rv-btn-primary:active:not(:disabled) { background: theme('colors.primary.700'); }
+  .rv-btn-secondary {
+    background: theme('colors.panel.raised');
+    border-color: theme('colors.border.strong');
+    color: theme('colors.text.primary');
+    box-shadow: inset 0 1px 0 rgb(255 255 255 / 0.035);
+  }
+  .rv-btn-secondary:hover:not(:disabled) {
+    background: theme('colors.panel.hover');
+    border-color: theme('colors.text.disabled');
+  }
+  .rv-btn-danger {
+    background: theme('colors.risk.muted');
+    border-color: theme('colors.risk.500 / 40%');
+    color: theme('colors.risk.300');
+  }
+  .rv-btn-danger:hover:not(:disabled) {
+    background: theme('colors.risk.500 / 18%');
+    border-color: theme('colors.risk.500 / 70%');
+  }
+  /* System control: compact, mono, for toolbars and filters */
+  .rv-btn-system {
+    height: 26px;
+    padding: 0 9px;
+    gap: 6px;
+    font-family: var(--font-mono);
+    font-size: 10.5px;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: theme('colors.text.secondary');
+    border-color: theme('colors.border.subtle');
+    border-radius: theme('borderRadius.sm');
+  }
+  .rv-btn-system:hover:not(:disabled) {
+    color: theme('colors.text.primary');
+    border-color: theme('colors.border.strong');
+    background: theme('colors.panel.hover');
+  }
+  .rv-btn-ghost {
+    color: theme('colors.text.secondary');
+  }
+  .rv-btn-ghost:hover:not(:disabled) {
+    color: theme('colors.text.primary');
+    background: theme('colors.panel.hover');
+  }
+  .rv-btn-sm { height: 26px; padding: 0 9px; font-size: 12px; }
+
+  .rv-input {
+    width: 100%;
+    height: 32px;
+    padding: 0 10px;
+    font-size: 13px;
+    color: theme('colors.text.primary');
+    background: theme('colors.surface');
+    border: 1px solid theme('colors.border.subtle');
+    border-radius: theme('borderRadius.md');
+    transition: border-color 120ms ease-out, box-shadow 120ms ease-out;
+  }
+  .rv-input::placeholder { color: theme('colors.text.muted'); }
+  .rv-input:hover { border-color: theme('colors.border.strong'); }
+  .rv-input:focus {
+    outline: none;
+    border-color: theme('colors.primary.500 / 70%');
+    box-shadow: 0 0 0 3px theme('colors.primary.500 / 14%');
+  }
+
+  /* Tabs: underline, not pills. Blue marks the active one only. */
+  .rv-tabs {
+    display: flex;
+    gap: 2px;
+    border-bottom: 1px solid theme('colors.border.subtle');
+  }
+  .rv-tab {
+    margin-bottom: -1px;
+    padding: 9px 12px;
+    font-size: 12.5px;
+    font-weight: 500;
+    color: theme('colors.text.secondary');
+    background: none;
+    border: 0;
+    border-bottom: 2px solid transparent;
+    cursor: pointer;
+    transition: color 120ms ease-out, border-color 120ms ease-out;
+  }
+  .rv-tab:hover { color: theme('colors.text.primary'); }
+  .rv-tab[aria-selected='true'],
+  .rv-tab.is-active {
+    color: theme('colors.text.primary');
+    border-bottom-color: theme('colors.primary.500');
+  }
+
+  /* Tooltip */
+  .rv-tooltip {
+    padding: 6px 8px;
+    font-family: var(--font-mono);
+    font-size: 10.5px;
+    line-height: 1.4;
+    color: theme('colors.text.primary');
+    background: theme('colors.canvas');
+    border: 1px solid theme('colors.border.strong');
+    border-radius: theme('borderRadius.sm');
+    box-shadow: theme('boxShadow.raised');
+  }
+
+  /* ======================================================================
+     DATA
+     ====================================================================== */
+  /* Operational table: hairline rows, no zebra, no floating row cards. */
+  .rv-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 12px;
+    text-align: left;
+  }
+  .rv-table thead th {
+    padding: 8px 14px;
+    font-family: var(--font-mono);
+    font-size: 10px;
+    font-weight: 500;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    white-space: nowrap;
+    color: theme('colors.text.muted');
+    border-bottom: 1px solid theme('colors.border.subtle');
+  }
+  .rv-table tbody tr {
+    border-bottom: 1px solid theme('colors.border.divider');
+    transition: background-color 100ms ease-out;
+  }
+  .rv-table tbody tr:last-child { border-bottom: 0; }
+  .rv-table tbody td {
+    padding: 9px 14px;
+    vertical-align: middle;
+  }
+  .rv-table tbody tr:hover {
+    background: theme('colors.panel.hover / 55%');
+  }
+  .rv-table tbody tr[aria-selected='true'],
+  .rv-table tbody tr.is-selected {
+    background: theme('colors.panel.focus');
+    box-shadow: inset 2px 0 0 theme('colors.primary.500');
+  }
+  /* Numeric column: right-aligned, mono, tabular */
+  .rv-table .rv-num {
+    text-align: right;
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+    font-weight: 500;
+    white-space: nowrap;
+  }
+
+  /* Metric block: label → value → context */
+  .rv-metric {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    min-width: 0;
+  }
+  .rv-metric-sub {
+    font-size: 11px;
+    line-height: 1.4;
+    color: theme('colors.text.muted');
+  }
+}
+
+/* Event / tone assignments. Kept outside @layer and at the end of the file so
+   they always win over the neutral fallbacks in the component rules above. */
+[data-kind='event']      { --tone: theme('colors.text.secondary'); }
+[data-kind='signal']     { --tone: theme('colors.primary.400'); }
+[data-kind='decision']   { --tone: theme('colors.ai.400'); }
+[data-kind='policy']     { --tone: theme('colors.text.primary'); }
+[data-kind='action']     { --tone: theme('colors.primary.400'); }
+[data-kind='outcome']    { --tone: theme('colors.success.400'); }
+[data-kind='escalation'] { --tone: theme('colors.warning.400'); }
+[data-kind='override']   { --tone: theme('colors.warning.300'); }
+[data-kind='block']      { --tone: theme('colors.risk.400'); }
+
+/* Generic semantic tone for badges / dots (not tied to an event kind) */
+[data-tone='neutral'] { --tone: theme('colors.text.secondary'); }
+[data-tone='system']  { --tone: theme('colors.primary.400'); }
+[data-tone='ai']      { --tone: theme('colors.ai.400'); }
+[data-tone='success'] { --tone: theme('colors.success.400'); }
+[data-tone='risk']    { --tone: theme('colors.risk.400'); }
+[data-tone='warning'] { --tone: theme('colors.warning.400'); }
+
+/* Authority layers (who is acting). Each tone equals the tone of the event kind the
+   layer wears, so a layer tag and the events it produces always agree. */
+[data-layer='intelligence'] { --tone: theme('colors.ai.400'); }
+[data-layer='policy']       { --tone: theme('colors.text.primary'); }
+[data-layer='system']       { --tone: theme('colors.primary.400'); }
+[data-layer='human']        { --tone: theme('colors.warning.400'); }
+
+/* Policy verdicts. The layer stays silver; only the verdict is coloured. */
+[data-verdict='authorized'] { --verdict: theme('colors.success.400'); }
+[data-verdict='rerouted']   { --verdict: theme('colors.warning.400'); }
+[data-verdict='downgraded'] { --verdict: theme('colors.warning.400'); }
+[data-verdict='blocked']    { --verdict: theme('colors.risk.400'); }
+[data-verdict='pending']    { --verdict: theme('colors.text.muted'); }

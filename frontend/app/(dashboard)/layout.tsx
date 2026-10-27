@@ -1,46 +1,37 @@
 'use client';
 
-import React, { useState, useCallback } from 'react';
+import React, { useCallback } from 'react';
+import { useRouter } from 'next/navigation';
 import { motion, useReducedMotion } from 'framer-motion';
 import { Sidebar } from '@/components/layout/Sidebar';
 import { Header } from '@/components/layout/Header';
-import { api } from '@/lib/api';
 
 export default function DashboardLayout({
   children,
 }: {
   children: React.ReactNode;
 }) {
-  const [isScanning, setIsScanning] = useState(false);
-  const [isAnalyzing, setIsAnalyzing] = useState(false);
+  const router = useRouter();
 
-  const handleScan = useCallback(async () => {
-    setIsScanning(true);
-    try {
-      await api.scanRevenue(100, 42);
-      await api.analyzeRevenue();
-    } catch (err) {
-      console.error('Scan error:', err);
-    } finally {
-      setIsScanning(false);
-    }
-  }, []);
+  // The header's Scan/Analyze actions hand off to the pages already built
+  // to run and show these workflows for real — Revenue Scanner owns the
+  // actual scan (with its own trigger, live state machine, and results),
+  // Recovery Brain owns the actual intelligence pass. Firing the same API
+  // calls again here in the background, with no page listening for the
+  // result, is what made these buttons look like they did nothing.
+  const handleScan = useCallback(() => {
+    router.push('/revenue-scanner');
+  }, [router]);
 
-  const handleAnalyze = useCallback(async () => {
-    setIsAnalyzing(true);
-    try {
-      await api.analyzeRevenue();
-    } catch (err) {
-      console.error('Analyze error:', err);
-    } finally {
-      setIsAnalyzing(false);
-    }
-  }, []);
+  const handleAnalyze = useCallback(() => {
+    router.push('/recovery-brain');
+  }, [router]);
 
   const reduceMotion = useReducedMotion();
 
   return (
-    <div className="min-h-screen bg-canvas text-text-primary flex flex-col">
+    <div className="rv-app isolate relative min-h-screen bg-canvas text-text-primary flex flex-col">
+      <div aria-hidden className="rv-backdrop" />
       <motion.div
         className="w-full"
         initial={reduceMotion ? undefined : { opacity: 0, y: -10 }}
@@ -50,8 +41,8 @@ export default function DashboardLayout({
         <Header
           onScan={handleScan}
           onAnalyze={handleAnalyze}
-          isScanning={isScanning}
-          isAnalyzing={isAnalyzing}
+          isScanning={false}
+          isAnalyzing={false}
         />
       </motion.div>
       <motion.div

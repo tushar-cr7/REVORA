@@ -6,6 +6,10 @@ export interface ScanResponse {
     amount_at_risk: number;
     count: number;
   }>;
+  /** Scan run id. Repeating a scan of identical source data re-activates that run instead of creating a new one. */
+  run_id?: string | null;
+  reused_existing_run?: boolean;
+  superseded_run_id?: string | null;
 }
 
 export interface AnalyzeResponse {
@@ -23,6 +27,7 @@ export interface AnalyzeResponse {
       brier: number;
     };
   };
+  run_id?: string | null;
 }
 
 export interface RecoverResponse {
@@ -40,7 +45,19 @@ export interface RecoverResponse {
   attempted_count: number;
   avg_recovery_value: number;
   intervention_success_rate_pct: number;
+  /** Computed from the attempt ledger (attempts that ran without an allowed execution-time authorization). */
   policy_violations: number;
+  /** The totals above cover the whole active run (unique outcomes); the `*_now` counts describe this call only. */
+  run_id?: string | null;
+  execution_mode?: string | null;
+  executed_now?: number;
+  recovered_now?: number;
+  not_recovered_now?: number;
+  suppressed_now?: number;
+  escalated_now?: number;
+  failed_now?: number;
+  blocked_now?: number;
+  skipped_now?: number;
 }
 
 export interface Transaction {
@@ -66,6 +83,7 @@ export interface Transaction {
   subscription_age_days?: number;
   contacts_today?: number;
   model_recovery_prob?: number;
+  run_id?: string | null;
 }
 
 export interface CandidateEvaluation {
@@ -88,6 +106,9 @@ export interface Decision {
   policy_reason: string;
   final_action: string;
   created_at: string;
+  run_id?: string | null;
+  case_id?: string | null;
+  policy_version?: string | null;
 }
 
 export interface Intervention {
@@ -109,6 +130,11 @@ export interface Intervention {
   timestamp: string;
   execution_probability_used?: number;
   idempotency_key?: string;
+  run_id?: string | null;
+  case_id?: string | null;
+  attempt_id?: string | null;
+  /** "simulation": nothing was sent to a payment network. */
+  execution_mode?: string | null;
 }
 
 export interface AuditEvent {
@@ -136,6 +162,19 @@ export interface AuditEvent {
   };
   correlation_id?: string;
   idempotency_key?: string;
+  run_id?: string | null;
+  case_id?: string | null;
+  attempt_id?: string | null;
+}
+
+export interface AuditLogResponse {
+  /** Number of entries returned (after `limit`). */
+  total: number;
+  entries: AuditEvent[];
+  /** Size of the full filtered log, before `limit` is applied. */
+  matched?: number | null;
+  /** Per-event-type counts across the full filtered log. */
+  counts_by_type?: Record<string, number>;
 }
 
 export interface Opportunity {
@@ -149,6 +188,9 @@ export interface Opportunity {
   recommended_action: string;
   policy_allowed: boolean;
   policy_reason: string;
+  run_id?: string | null;
+  case_id?: string | null;
+  case_state?: string | null;
 }
 
 export interface PolicyLimits {
@@ -198,6 +240,10 @@ export interface AnalyticsResponse {
   intervention_success_rate_pct: number;
   policy_blocked_count: number;
   escalation_count: number;
+  /** Amount of cases with at least one recovery attempt (not the same as recovered). */
+  attempted_amount?: number;
+  run_id?: string | null;
+  execution_mode?: string | null;
 }
 
 export interface CopilotResponse {

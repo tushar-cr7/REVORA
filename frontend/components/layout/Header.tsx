@@ -1,9 +1,8 @@
 'use client';
 
 import React from 'react';
-import { RefreshCw, Bell, ChevronDown, Sparkles } from 'lucide-react';
+import { RefreshCw, Bell, Sparkles } from 'lucide-react';
 import { RevoraLogo } from '@/components/brand/RevoraLogo';
-import { motion } from 'framer-motion';
 
 interface HeaderProps {
   onScan: () => void;
@@ -19,67 +18,75 @@ export const Header: React.FC<HeaderProps> = ({
   isAnalyzing,
 }) => {
   return (
-    <header className="h-16 bg-surface/80 backdrop-blur-md border-b border-border-subtle px-6 flex items-center justify-between sticky top-0 z-30">
+    <header className="h-14 bg-surface/95 backdrop-blur-sm border-b border-border-subtle px-5 flex items-center justify-between sticky top-0 z-30">
       {/* Brand & Context */}
-      <div className="flex items-center space-x-6">
-        <div className="flex items-center space-x-4">
-          <RevoraLogo variant="mark" width={28} height={28} />
-          <div className="h-4 w-px bg-border-strong hidden sm:block" />
-          <div className="hidden sm:flex flex-col justify-center">
-            <h1 className="text-text-primary font-medium text-[15px] tracking-tight leading-none mb-1">
+      <div className="flex items-center gap-5">
+        <div className="flex items-center gap-3.5">
+          <RevoraLogo variant="mark" width={26} height={26} />
+          <div className="h-5 w-px bg-border-subtle hidden sm:block" />
+          <div className="hidden sm:flex flex-col justify-center gap-1">
+            <h1 className="text-text-primary font-semibold text-[14px] tracking-[-0.015em] leading-none">
               Revenue Command
             </h1>
-            <p className="text-text-muted text-[11px] uppercase tracking-wider font-mono leading-none">
-              NORTHSTAR COMMERCE
+            <p className="rv-label leading-none">
+              Northstar Commerce
             </p>
           </div>
         </div>
 
-        <div className="h-5 w-px bg-border-divider hidden md:block" />
-
-        {/* Live System Indicator */}
-        <div className="hidden md:flex items-center space-x-2 px-3 py-1.5 rounded-full bg-success-muted border border-success-500/20">
-          <span className="relative flex h-2 w-2">
-            <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-success-400 opacity-75"></span>
-            <span className="relative inline-flex rounded-full h-2 w-2 bg-success-500"></span>
+        {/* System state: a status read-out, not a decoration */}
+        <div className="hidden md:flex items-center gap-2 h-6 pl-2 pr-2.5 rounded-sm bg-success-500/[0.07] border border-success-500/20">
+          <span className="rv-dot" data-tone="success" data-live />
+          <span className="font-mono text-[10px] font-medium tracking-[0.12em] uppercase text-success-300">
+            System active
           </span>
-          <span className="text-success-500 text-[11px] font-mono font-medium tracking-wide">SYSTEM ACTIVE</span>
         </div>
       </div>
 
       {/* Actions & User Control */}
-      <div className="flex items-center space-x-3">
-        {/* Run Scan Button */}
+      <div className="flex items-center gap-2">
+        {/* Below `sm` the labels collapse (icon-only Scan, short Analyze) so the
+            whole control cluster fits a phone-width header. */}
         <button
           onClick={onScan}
           disabled={isScanning}
-          className="flex items-center space-x-2 px-3 py-1.5 rounded-md bg-panel hover:bg-panel-hover border border-border-strong text-text-secondary hover:text-text-primary transition-colors disabled:opacity-50"
+          aria-label="Scan Revenue"
+          className="rv-btn rv-btn-secondary"
         >
-          <RefreshCw className={`w-3.5 h-3.5 ${isScanning ? 'animate-spin text-primary-300' : ''}`} />
-          <span className="text-[13px] font-medium">{isScanning ? 'Scanning...' : 'Scan Revenue'}</span>
+          <RefreshCw className={`w-3.5 h-3.5 ${isScanning ? 'animate-spin text-primary-300' : 'text-text-secondary'}`} strokeWidth={1.75} />
+          <span className="hidden sm:inline">{isScanning ? 'Scanning…' : 'Scan Revenue'}</span>
         </button>
 
-        {/* Analyze Risk Button */}
         <button
           onClick={onAnalyze}
           disabled={isAnalyzing}
-          className="flex items-center space-x-2 px-4 py-1.5 rounded-md bg-ai-600 hover:bg-ai-500 text-white shadow-sm transition-colors disabled:opacity-50"
+          className="rv-btn rv-btn-primary"
         >
-          <Sparkles className={`w-3.5 h-3.5 ${isAnalyzing ? 'animate-spin' : ''}`} />
-          <span className="text-[13px] font-medium">{isAnalyzing ? 'Analyzing...' : 'Analyze Intelligence'}</span>
+          <Sparkles className={`w-3.5 h-3.5 ${isAnalyzing ? 'animate-spin' : ''}`} strokeWidth={1.75} />
+          <span>
+            {isAnalyzing ? 'Analyzing…' : (
+              <>
+                Analyze<span className="hidden sm:inline"> Intelligence</span>
+              </>
+            )}
+          </span>
         </button>
 
-        <div className="h-5 w-px bg-border-divider mx-1" />
+        <div className="h-5 w-px bg-border-subtle mx-1.5 hidden sm:block" />
 
-        {/* Notifications Bell */}
-        <button className="p-2 rounded-md hover:bg-panel border border-transparent hover:border-border-subtle text-text-muted hover:text-text-primary transition-colors relative">
-          <Bell className="w-4 h-4" />
-          <span className="absolute top-2 right-2 w-1.5 h-1.5 rounded-full bg-ai-500 ring-2 ring-surface" />
+        <button
+          aria-label="Notifications"
+          className="relative w-8 h-8 inline-flex items-center justify-center rounded-md border border-transparent hover:border-border-subtle hover:bg-panel text-text-muted hover:text-text-primary transition-colors"
+        >
+          <Bell className="w-4 h-4" strokeWidth={1.75} />
+          <span className="absolute top-1.5 right-1.5 w-1.5 h-1.5 rounded-full bg-primary-500 ring-2 ring-surface" />
         </button>
-        
-        {/* Profile */}
-        <button className="w-8 h-8 rounded-full bg-panel border border-border-strong flex items-center justify-center overflow-hidden hover:border-primary-500 transition-colors">
-          <span className="text-xs font-medium text-text-secondary">NC</span>
+
+        <button
+          aria-label="Account"
+          className="w-8 h-8 rounded-md bg-panel-raised border border-border-strong flex items-center justify-center hover:border-text-disabled transition-colors"
+        >
+          <span className="font-mono text-[11px] font-medium text-text-secondary">NC</span>
         </button>
       </div>
     </header>
