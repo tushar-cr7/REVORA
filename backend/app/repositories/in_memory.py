@@ -1,4 +1,5 @@
 import threading
+from dataclasses import replace
 from datetime import datetime, timezone
 from typing import Any, ContextManager, Dict, List, Optional, Sequence, Tuple
 from backend.app.domain.events import RevenueObligation, SourceEvent, obligation_internal_id
@@ -14,6 +15,13 @@ from backend.app.domain.models import (
     Transaction,
     new_id,
     utc_now_iso,
+)
+from backend.app.domain.workspaces import (
+    Workspace,
+    WorkspaceAlreadyExists,
+    demo_seed_workspace,
+    require_demo_workspace,
+    validate_new_workspace,
 )
 from backend.app.repositories.base import BaseRepository
 from backend.app.repositories.errors import DuplicateIdempotencyKey, EventIdentityConflict
@@ -38,10 +46,16 @@ class InMemoryRepository(BaseRepository):
       repository returns copies, so production code must always `save_*` what it changed.)
     * Scans never delete: a new run supersedes the old one, and every record keeps
       the `run_id` it was created under.
+    * Workspaces mirror migration 0003: the store starts with the seeded demo workspace, a
+      synthetic run is refused outside a registered demo workspace, workspaces are handed out
+      as copies (so their kind cannot be changed) and `clear()` keeps them.
     """
 
     def __init__(self):
         self._lock = threading.RLock()
+        # workspace_id -> Workspace, in registration order
+        seed = demo_seed_workspace()
+        self._workspaces: Dict[str, Workspace] = {seed.workspace_id: seed}
         self._runs: Dict[str, ScanRun] = {}
         self._run_by_fingerprint: Dict[str, str] = {}
         self._active_run_id: Optional[str] = None
@@ -89,11 +103,34 @@ class InMemoryRepository(BaseRepository):
             return ALL_RUNS
         return run_id or self._active_run_id
 
+    # ── workspaces ───────────────────────────────────────────────────────
+    def get_workspace(self, workspace_id: str) -> Optional[Workspace]:
+        with self._lock:
+            workspace = self._workspaces.get(workspace_id)
+            return replace(workspace) if workspace else None
+
+    def list_workspaces(self) -> List[Workspace]:
+        with self._lock:
+            return [replace(w) for w in self._workspaces.values()]
+
+    def create_workspace(self, workspace: Workspace) -> Workspace:
+        validate_new_workspace(workspace)
+        with self._lock:
+            if workspace.workspace_id in self._workspaces:
+                raise WorkspaceAlreadyExists(
+                    f"Workspace {workspace.workspace_id!r} already exists; workspaces are never redefined.",
+                    workspace.workspace_id,
+                )
+            self._workspaces[workspace.workspace_id] = replace(workspace)
+            return replace(workspace)
+
     # ── scan runs ────────────────────────────────────────────────────────
     def register_scan_run(
         self, run: ScanRun, transactions: List[Transaction], cases: List[RecoveryCase]
     ) -> Tuple[ScanRun, bool]:
         with self._lock:
+            # Synthetic data only in a registered demo workspace (PostgreSQL also refuses the row itself).
+            require_demo_workspace(self._workspaces.get(run.merchant_id), run.merchant_id)
             existing_id = self._run_by_fingerprint.get(run.source_fingerprint)
             if existing_id is not None:
                 return self._activate(existing_id), False

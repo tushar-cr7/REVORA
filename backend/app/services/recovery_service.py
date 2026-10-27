@@ -21,6 +21,7 @@ from backend.app.domain.models import (
     utc_now_iso,
 )
 from backend.app.domain.policy import DEFAULT_POLICY, POLICY_VERSION, PolicyLimits, evaluate_policy_strict
+from backend.app.domain.workspaces import require_demo_workspace
 from backend.app.intelligence.data_gen import generate_dataset
 from backend.app.intelligence.model import RecoveryModel
 from backend.app.intelligence.decision_engine import decide_intervention
@@ -133,7 +134,11 @@ class RecoveryService:
         * Identical source data re-activates the existing run with all of its state, so
           repeating a scan (the dashboard does, on every page load) cannot reset history
           or reopen cases that already ran.
+        * The data is synthetic, so `merchant_id` must name a registered DEMO workspace. An unknown
+          workspace is refused (UnknownWorkspace), never created; a merchant workspace is refused
+          (SyntheticDataNotAllowed). Both before anything is generated or stored.
         """
+        require_demo_workspace(self.repo.get_workspace(merchant_id), merchant_id)
         fingerprint = scan_fingerprint(merchant_id, n_total, seed)
         previous = self.repo.get_active_run()
 

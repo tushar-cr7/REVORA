@@ -11,7 +11,8 @@ Transaction model
 
 Safety is also enforced by constraints that do not depend on any caller being careful: see
 migrations/0001 (one in-flight attempt per case, one recovery per case, one idempotency record
-per scope) and 0002 (one event per source identity, one case per obligation).
+per scope), 0002 (one event per source identity, one case per obligation) and 0003 (a synthetic scan
+run only in a registered demo workspace; workspaces never change kind and are never deleted).
 
 Everything returned is a COPY. Persist changes with the matching `save_*` call.
 """
@@ -42,6 +43,7 @@ from backend.app.domain.models import (
     ScanRun,
     Transaction,
 )
+from backend.app.domain.workspaces import Workspace, WorkspaceAlreadyExists, require_demo_workspace, validate_new_workspace
 from backend.app.repositories.base import BaseRepository
 from backend.app.repositories.errors import (
     DuplicateIdempotencyKey,
@@ -121,6 +123,19 @@ def _j(value: Any) -> Optional[Json]:
 
 
 # ── row mappers ──────────────────────────────────────────────────────────
+def _workspace(r: Dict[str, Any]) -> Workspace:
+    return Workspace(
+        workspace_id=r["workspace_id"],
+        kind=r["kind"],
+        display_name=r["display_name"],
+        base_currency=r["base_currency"],
+        timezone=r["timezone"],
+        execution_mode=r["execution_mode"],
+        origin=r["origin"],
+        created_at=_iso(r["created_at"]),
+    )
+
+
 def _run(r: Dict[str, Any]) -> ScanRun:
     return ScanRun(
         run_id=r["run_id"],
@@ -519,6 +534,42 @@ class PostgresRepository(BaseRepository):
             return f"{column} = %s", [run_id]
         return f"{column} = {_ACTIVE_RUN}", []
 
+    # ── workspaces ───────────────────────────────────────────────────────
+    def get_workspace(self, workspace_id: str) -> Optional[Workspace]:
+        with self._cursor() as cur:
+            cur.execute("SELECT * FROM workspaces WHERE workspace_id = %s", (workspace_id,))
+            row = cur.fetchone()
+            return _workspace(row) if row else None
+
+    def list_workspaces(self) -> List[Workspace]:
+        with self._cursor() as cur:
+            cur.execute("SELECT * FROM workspaces ORDER BY seq")
+            return [_workspace(r) for r in cur.fetchall()]
+
+    def create_workspace(self, workspace: Workspace) -> Workspace:
+        validate_new_workspace(workspace)
+        with self._cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO workspaces (workspace_id, kind, display_name, base_currency, timezone, execution_mode,
+                                        origin, created_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (workspace_id) DO NOTHING
+                RETURNING *
+                """,
+                (
+                    workspace.workspace_id, workspace.kind, workspace.display_name, workspace.base_currency,
+                    workspace.timezone, workspace.execution_mode, workspace.origin, _ts(workspace.created_at),
+                ),
+            )
+            row = cur.fetchone()
+            if row is None:
+                raise WorkspaceAlreadyExists(
+                    f"Workspace {workspace.workspace_id!r} already exists; workspaces are never redefined.",
+                    workspace.workspace_id,
+                )
+            return _workspace(row)
+
     # ── scan runs ────────────────────────────────────────────────────────
     def register_scan_run(
         self, run: ScanRun, transactions: List[Transaction], cases: List[RecoveryCase]
@@ -528,6 +579,11 @@ class PostgresRepository(BaseRepository):
                 raise ValueError(f"Case {case.case_id} belongs to run {case.run_id}, not {run.run_id}.")
         with self._cursor() as cur:
             self._lock_registry(cur)
+            # Synthetic data only in a registered demo workspace. The database refuses the row on its own as well
+            # (migration 0003); checking first gives the caller a typed error instead of a constraint violation.
+            cur.execute("SELECT * FROM workspaces WHERE workspace_id = %s", (run.merchant_id,))
+            row = cur.fetchone()
+            require_demo_workspace(_workspace(row) if row else None, run.merchant_id)
             cur.execute("SELECT run_id FROM scan_runs WHERE source_fingerprint = %s", (run.source_fingerprint,))
             existing = cur.fetchone()
             if existing is not None:

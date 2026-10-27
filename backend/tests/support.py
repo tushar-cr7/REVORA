@@ -20,6 +20,7 @@ from backend.app.domain.models import (
     new_id,
     utc_now_iso,
 )
+from backend.app.domain.workspaces import new_workspace
 from backend.app.integrations.base import PaymentExecutionProvider
 from backend.app.repositories.in_memory import InMemoryRepository
 from backend.app.services.audit_service import AuditService
@@ -183,8 +184,15 @@ def build_service(
     return service
 
 
+def ensure_demo_workspace(repo, workspace_id: str) -> None:
+    """Register `workspace_id` as a demo workspace if it is not one yet — explicitly, as the application never does."""
+    if repo.get_workspace(workspace_id) is None:
+        repo.create_workspace(new_workspace(workspace_id, "demo", f"Test workspace {workspace_id}"))
+
+
 def register_run(service: RecoveryService, transactions: List[Transaction], seed: int = 1) -> ScanRun:
     merchant_id = transactions[0].merchant_id
+    ensure_demo_workspace(service.repo, merchant_id)   # a synthetic run needs a registered demo workspace
     run_id = new_id("run", 8)
     now = utc_now_iso()
     for tx in transactions:

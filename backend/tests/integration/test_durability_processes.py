@@ -83,13 +83,13 @@ SECOND_PROCESS = """
 
 def test_the_whole_application_state_survives_a_real_process_restart(pg_dsn, pg_schema):
     migrate = run_python("import sys; from backend.app.db.migrate import main; sys.exit(main(['upgrade']))", app_env(pg_dsn, pg_schema))
-    assert migrate.returncode == 0 and "applied: [1, 2]" in migrate.stdout, migrate.stderr
+    assert migrate.returncode == 0 and "applied: [1, 2, 3]" in migrate.stdout, migrate.stderr
     status = run_python("import sys; from backend.app.db.migrate import main; sys.exit(main(['status']))", app_env(pg_dsn, pg_schema))
-    assert "current=2" in status.stdout and "pending=[]" in status.stdout
+    assert "current=3" in status.stdout and "pending=[]" in status.stdout
 
     first = last_json(run_python(FIRST_PROCESS, app_env(pg_dsn, pg_schema)))
     assert first["ready"]["status"] == "ok" and first["ready"]["storage"]["durable"] is True
-    assert first["ready"]["storage"]["backend"] == "postgres" and first["ready"]["storage"]["schema_version"] == 2
+    assert first["ready"]["storage"]["backend"] == "postgres" and first["ready"]["storage"]["schema_version"] == 3
     assert first["status"] == 200 and first["intervention"]["execution_mode"] == "simulation"
     assert first["cases"] == 80 and first["interventions"] == 1 and first["audit"] >= 80
 
@@ -163,7 +163,7 @@ def test_auto_migrate_is_opt_in_and_works(pg_dsn, pg_schema):
         app_env(pg_dsn, pg_schema, REVORA_DB_AUTO_MIGRATE="1"),
     )
     assert proc.returncode == 0, proc.stderr[-2000:]
-    assert "'durable': True" in proc.stdout and "'schema_version': 2" in proc.stdout
+    assert "'durable': True" in proc.stdout and "'schema_version': 3" in proc.stdout
 
 
 def test_memory_mode_is_explicit_and_reported_as_not_durable():

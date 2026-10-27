@@ -22,6 +22,7 @@ from backend.app.api.schemas import (
 from backend.app.api.runtime import container, server_error
 from backend.app.domain.models import InvalidCaseTransition
 from backend.app.domain.policy import POLICY_VERSION, PolicyLimits
+from backend.app.domain.workspaces import WorkspaceError
 from backend.app.services.execution_service import ExecutionError
 
 router = APIRouter(prefix="/api", tags=["revenue"])
@@ -63,9 +64,15 @@ def health_ready():
 
 @router.post("/scan", response_model=ScanResponse)
 def scan_revenue(req: ScanRequest = ScanRequest()):
+    """
+    Generate a SYNTHETIC demo dataset as a scan run. Only for a registered demo workspace:
+    422 `unknown_workspace` (never auto-created), 409 `synthetic_data_not_allowed` for a merchant workspace.
+    """
     try:
         res = recovery_service.scan_revenue(n_total=req.n_total, seed=req.seed, merchant_id=req.merchant_id)
         return ScanResponse(**res)
+    except WorkspaceError as e:
+        return JSONResponse(status_code=e.status_code, content=e.to_body())
     except psycopg2.Error as e:
         raise server_error("Scan failed", e)
     except Exception as e:

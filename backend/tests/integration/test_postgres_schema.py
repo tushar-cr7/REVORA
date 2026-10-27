@@ -36,30 +36,30 @@ def raw(pg_dsn, pg_schema):
 
 
 def test_migrations_apply_in_order_and_are_recorded(pg_dsn, pg_schema, raw):
-    assert migrate.upgrade(pg_dsn, pg_schema) == [1, 2]
+    assert migrate.upgrade(pg_dsn, pg_schema) == [1, 2, 3]
     rows = raw("SELECT version, name, checksum FROM schema_migrations ORDER BY version")
-    assert [(v, n) for v, n, _ in rows] == [(1, "core_recovery_schema"), (2, "event_ingestion")]
+    assert [(v, n) for v, n, _ in rows] == [(1, "core_recovery_schema"), (2, "event_ingestion"), (3, "workspaces")]
     assert all(len(c) == 64 for _, _, c in rows)
     tables = {r[0] for r in raw("SELECT table_name FROM information_schema.tables WHERE table_schema = current_schema()")}
     assert {"scan_runs", "transactions", "recovery_cases", "decisions", "execution_attempts", "interventions",
             "idempotency_records", "audit_events", "source_events", "source_event_raw", "revenue_obligations",
-            "schema_migrations"} <= tables
+            "workspaces", "schema_migrations"} <= tables
 
 
 def test_upgrading_again_is_a_no_op(pg_dsn, pg_schema):
     migrate.upgrade(pg_dsn, pg_schema)
     assert migrate.upgrade(pg_dsn, pg_schema) == []
-    assert migrate.status(pg_dsn, pg_schema) == {"head": 2, "current": 2, "pending": [], "applied": [1, 2]}
+    assert migrate.status(pg_dsn, pg_schema) == {"head": 3, "current": 3, "pending": [], "applied": [1, 2, 3]}
 
 
 def test_a_database_at_an_older_version_upgrades_without_losing_rows(pg_dsn, pg_schema, raw):
     assert migrate.upgrade(pg_dsn, pg_schema, target=1) == [1]
-    assert migrate.status(pg_dsn, pg_schema)["pending"] == [2]
+    assert migrate.status(pg_dsn, pg_schema)["pending"] == [2, 3]
     raw("""INSERT INTO scan_runs (run_id, merchant_id, source_fingerprint, n_total, seed, created_at, last_scanned_at,
                                   status) VALUES ('run_old', 'm', 'fp_old', 1, 7, now(), now(), 'active')""")
     raw("""INSERT INTO transactions (run_id, transaction_id, ordinal, leak_id, merchant_id, customer_id, amount, leak_type,
                                      event_time) VALUES ('run_old', 'tx_1', 0, 'fp_1', 'm', 'c', 100.50, 'failed_payment', 'x')""")
-    assert migrate.upgrade(pg_dsn, pg_schema) == [2]
+    assert migrate.upgrade(pg_dsn, pg_schema) == [2, 3]
     assert raw("SELECT run_id, kind, status FROM scan_runs") == [("run_old", "synthetic_scan", "active")]
     assert raw("SELECT amount FROM transactions")[0][0] == pytest.approx(100.50)
 
@@ -77,7 +77,7 @@ def test_starting_against_the_wrong_schema_version_is_a_clear_error(pg_dsn, pg_s
     with pytest.raises(SchemaNotReady, match="no REVORA schema"):
         PostgresRepository.connect(pg_dsn, schema=pg_schema)           # never migrated
     migrate.upgrade(pg_dsn, pg_schema, target=1)
-    with pytest.raises(SchemaNotReady, match="at version 1 but this code needs 2"):
+    with pytest.raises(SchemaNotReady, match="at version 1 but this code needs 3"):
         PostgresRepository.connect(pg_dsn, schema=pg_schema)           # behind
     migrate.upgrade(pg_dsn, pg_schema)
     raw("INSERT INTO schema_migrations (version, name, checksum) VALUES (99, 'future', 'x')")
@@ -90,7 +90,7 @@ def test_starting_against_the_wrong_schema_version_is_a_clear_error(pg_dsn, pg_s
 def test_auto_migrate_brings_an_empty_database_to_the_current_version(pg_dsn, pg_schema):
     repository = PostgresRepository.connect(pg_dsn, schema=pg_schema, auto_migrate=True)
     try:
-        assert repository.describe()["schema_version"] == 2 == repository.describe()["schema_head"]
+        assert repository.describe()["schema_version"] == 3 == repository.describe()["schema_head"]
     finally:
         repository.close()
 
@@ -124,8 +124,8 @@ def test_concurrent_migrators_apply_each_migration_exactly_once(pg_dsn, pg_schem
     for t in threads:
         t.join(timeout=60)
     assert not errors, errors
-    assert sorted(v for applied in results for v in applied) == [1, 2]       # no migration ran twice
-    assert [v for (v,) in raw("SELECT version FROM schema_migrations ORDER BY version")] == [1, 2]
+    assert sorted(v for applied in results for v in applied) == [1, 2, 3]    # no migration ran twice
+    assert [v for (v,) in raw("SELECT version FROM schema_migrations ORDER BY version")] == [1, 2, 3]
 
 
 def test_crlf_checkouts_do_not_change_a_migrations_identity(tmp_path):
@@ -219,7 +219,7 @@ def test_history_cannot_be_deleted_out_from_under_its_children(raw, seeded):
 def test_only_one_run_can_be_active(raw, seeded):
     with refused_by(pgerr.UniqueViolation, "scan_runs_one_active"):
         raw("""INSERT INTO scan_runs (run_id, merchant_id, source_fingerprint, n_total, seed, created_at, last_scanned_at,
-                                      status) VALUES ('run_second', 'm', 'fp_second', 1, 1, now(), now(), 'active')""")
+                                      status) VALUES ('run_second', 'merch_test', 'fp_second', 1, 1, now(), now(), 'active')""")
     with refused_by(pgerr.UniqueViolation, "scan_runs_fingerprint_key"):   # the same source data is one run
         clone(raw, "scan_runs", "run_id", seeded["run"], run_id="run_dupe", status="superseded")
 

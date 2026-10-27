@@ -1,6 +1,7 @@
 from abc import ABC, abstractmethod
 from typing import Any, ContextManager, Dict, List, Optional, Sequence, Tuple
 from backend.app.domain.events import RevenueObligation, SourceEvent
+from backend.app.domain.workspaces import Workspace
 from backend.app.domain.models import (
     AuditEvent,
     Decision,
@@ -55,6 +56,26 @@ class BaseRepository(ABC):
         Must be called inside `atomic()`. No-op where `atomic()` is already a global lock.
         """
 
+    # ── workspaces (Phase 3.0) ───────────────────────────────────────────
+    # A fresh store holds exactly the seeded demo workspace (domain/workspaces.demo_seed_workspace), as a
+    # freshly migrated database does. Workspaces are never updated through this interface, never deleted,
+    # and never created implicitly by any other method.
+    @abstractmethod
+    def get_workspace(self, workspace_id: str) -> Optional[Workspace]:
+        """A copy of the workspace, or None if it was never registered."""
+
+    @abstractmethod
+    def list_workspaces(self) -> List[Workspace]:
+        """Every workspace, in registration order."""
+
+    @abstractmethod
+    def create_workspace(self, workspace: Workspace) -> Workspace:
+        """
+        Register a NEW workspace. It is validated first (InvalidWorkspace) and must have origin 'explicit';
+        the other origins belong to migration 0003. Raises WorkspaceAlreadyExists if the id is taken; an
+        existing workspace is never modified.
+        """
+
     # ── scan runs ────────────────────────────────────────────────────────
     @abstractmethod
     def register_scan_run(
@@ -65,6 +86,10 @@ class BaseRepository(ABC):
         (the previously active run becomes `superseded`; nothing is deleted). If a
         run with the same source fingerprint already exists it is re-activated
         instead and the arguments are discarded. Returns (run, created).
+
+        A scan run holds synthetic data, so `run.merchant_id` must be a registered DEMO workspace:
+        UnknownWorkspace / SyntheticDataNotAllowed otherwise, with nothing stored. PostgreSQL also
+        refuses such a row on its own (migration 0003).
         """
 
     @abstractmethod
@@ -302,4 +327,7 @@ class BaseRepository(ABC):
 
     @abstractmethod
     def clear(self):
-        """Delete everything. Test-only: implementations refuse unless explicitly enabled."""
+        """
+        Delete every record except the workspace registry (workspaces are never deleted, on PostgreSQL
+        by a trigger). Test-only: implementations refuse unless explicitly enabled.
+        """
