@@ -90,7 +90,7 @@ def service_on(repo) -> RecoveryService:
 
 # ── migration ────────────────────────────────────────────────────────────
 def test_a_fresh_schema_migrates_to_head_with_only_the_seeded_demo_workspace(pg_dsn, pg_schema, raw):
-    assert migrate.upgrade(pg_dsn, pg_schema) == [1, 2, 3]
+    assert migrate.upgrade(pg_dsn, pg_schema) == [1, 2, 3, 4]
     assert raw("SELECT name FROM schema_migrations WHERE version = 3") == [("workspaces",)]
     assert raw("SELECT workspace_id, kind, execution_mode, origin, base_currency FROM workspaces") == [
         (DEMO_WORKSPACE_ID, "demo", "simulation", "demo_seed", "INR")
@@ -147,7 +147,7 @@ def test_a_database_at_0002_upgrades_and_every_existing_workspace_id_is_backfill
         raw(statement)
     counts_before = {t: raw(f"SELECT count(*) FROM {t}")[0][0] for t in _V2_TABLES}
 
-    assert migrate.upgrade(pg_dsn, pg_schema) == [3]
+    assert migrate.upgrade(pg_dsn, pg_schema, target=3) == [3]   # 0003 itself: this data predates 0004's rules
 
     # Nothing was lost or rewritten.
     assert {t: raw(f"SELECT count(*) FROM {t}")[0][0] for t in _V2_TABLES} == counts_before
@@ -163,14 +163,14 @@ def test_a_database_at_0002_upgrades_and_every_existing_workspace_id_is_backfill
     assert set(found.values()) == {("demo", "simulation", "pre_phase3_backfill", "INR", "UTC")}
     # Every run now names its workspace's kind.
     assert raw("SELECT run_id, workspace_kind FROM scan_runs ORDER BY run_id") == [("run_a", "demo"), ("run_i", "demo")]
-    assert migrate.status(pg_dsn, pg_schema) == {"head": 3, "current": 3, "pending": [], "applied": [1, 2, 3]}
+    assert migrate.status(pg_dsn, pg_schema) == {"head": 4, "current": 3, "pending": [4], "applied": [1, 2, 3]}
 
 
 def test_the_demo_seed_is_added_when_an_upgraded_database_never_used_it(pg_dsn, pg_schema, raw):
     migrate.upgrade(pg_dsn, pg_schema, target=2)
     raw("""INSERT INTO scan_runs (run_id, merchant_id, source_fingerprint, n_total, seed, created_at, last_scanned_at, status)
            VALUES ('run_x', 'other_demo', 'fp_x', 1, 1, now(), now(), 'active')""")
-    assert migrate.upgrade(pg_dsn, pg_schema) == [3]
+    assert migrate.upgrade(pg_dsn, pg_schema, target=3) == [3]
     assert raw("SELECT workspace_id, origin FROM workspaces ORDER BY workspace_id") == [
         ("merch_001", "demo_seed"), ("other_demo", "pre_phase3_backfill")
     ]
@@ -190,7 +190,7 @@ def test_the_database_refuses_a_synthetic_run_in_a_merchant_or_unknown_workspace
     # Claiming the demo kind does not help: the database derives it from the workspace registry.
     with refused_by(pgerr.CheckViolation, "scan_runs_synthetic_only_in_demo"):
         insert_run(head, "run_m2", "acme", workspace_kind="demo")
-    with refused_by(pgerr.CheckViolation, "scan_runs_synthetic_has_workspace"):
+    with refused_by(pgerr.NotNullViolation):         # since 0004 every run names a registered workspace (was: a CHECK)
         insert_run(head, "run_u", "never_registered")
     # Moving an existing demo run into a merchant workspace is refused the same way.
     insert_run(head, "run_ok", DEMO_WORKSPACE_ID)
@@ -207,13 +207,12 @@ def test_the_foreign_key_backs_the_derivation_trigger(head):
         insert_run(head, "run_lie", "acme", workspace_kind="demo")
 
 
-def test_ingestion_runs_keep_their_phase_2_behaviour(head):
+def test_ingestion_runs_belong_to_registered_workspaces_only(head):
     insert_run(head, "run_ing_m", "acme", kind="ingestion", status="standby", source_fingerprint="ingest:acme")
-    insert_run(head, "run_ing_u", "unregistered_claim", kind="ingestion", status="standby",
-               source_fingerprint="ingest:unregistered_claim")
-    assert head("SELECT run_id, workspace_kind FROM scan_runs ORDER BY run_id") == [
-        ("run_ing_m", "merchant"), ("run_ing_u", None)   # an unregistered claim stays unregistered: no workspace invented
-    ]
+    with refused_by(pgerr.NotNullViolation):         # Phase 3.0 allowed this (label NULL); 0004 does not
+        insert_run(head, "run_ing_u", "unregistered_claim", kind="ingestion", status="standby",
+                   source_fingerprint="ingest:unregistered_claim")
+    assert head("SELECT run_id, workspace_kind FROM scan_runs ORDER BY run_id") == [("run_ing_m", "merchant")]
 
 
 def test_a_workspace_kind_and_identity_cannot_change_and_a_workspace_cannot_be_deleted(head):
@@ -307,9 +306,11 @@ def test_the_repository_registers_synthetic_runs_only_in_a_demo_workspace(any_re
         any_repo.register_scan_run(_scan_run("acme"), [], [])
     with pytest.raises(UnknownWorkspace):
         any_repo.register_scan_run(_scan_run("never_registered"), [], [])
-    assert any_repo.list_runs() == [] and any_repo.get_active_run() is None    # refusals left nothing behind
+    # refusals left nothing behind
+    for ws in ("acme", "never_registered", DEMO_WORKSPACE_ID):
+        assert any_repo.list_runs(workspace_id=ws) == [] and any_repo.get_active_run(workspace_id=ws) is None
     run, created = any_repo.register_scan_run(_scan_run(DEMO_WORKSPACE_ID), [], [])
-    assert created and any_repo.get_active_run().run_id == run.run_id
+    assert created and any_repo.get_active_run(workspace_id=DEMO_WORKSPACE_ID).run_id == run.run_id
 
 
 def test_clear_keeps_the_workspace_registry(any_repo):
@@ -323,7 +324,7 @@ def test_events_for_a_registered_merchant_workspace_still_open_inert_cases(any_r
     pipe = Pipeline(any_repo)
     result = pipe.ingest("e1", merchant="acme", ref="ord_9")
     assert result.detection.outcome.value == "case_opened"
-    run = any_repo.get_run(pipe.obligation(merchant="acme", ref="ord_9").run_id)
+    run = any_repo.get_run(pipe.obligation(merchant="acme", ref="ord_9").run_id, workspace_id="acme")
     assert (run.kind, run.status) == ("ingestion", "standby")                  # still never active, never executable
 
 
@@ -341,7 +342,8 @@ def test_the_scan_service_refuses_unknown_and_merchant_workspaces_and_generates_
         service.scan_revenue(n_total=10, seed=1, merchant_id="ghost")
     with pytest.raises(SyntheticDataNotAllowed):
         service.scan_revenue(n_total=10, seed=1, merchant_id="acme")
-    assert any_repo.list_runs() == [] and any_repo.get_workspace("ghost") is None   # nothing was auto-created
+    assert any_repo.list_runs(workspace_id=DEMO_WORKSPACE_ID) == [] and any_repo.list_runs(workspace_id="acme") == []
+    assert any_repo.get_workspace("ghost") is None                                  # nothing was auto-created
 
 
 def test_the_scan_service_still_scans_demo_workspaces(any_repo):
@@ -349,9 +351,10 @@ def test_the_scan_service_still_scans_demo_workspaces(any_repo):
     service = service_on(any_repo)
     first = service.scan_revenue(n_total=20, seed=3)                          # the default: the seeded demo workspace
     assert first["total_transactions_scanned"] == 20 and not first["reused_existing_run"]
-    assert any_repo.get_run(first["run_id"]).merchant_id == DEMO_WORKSPACE_ID
+    assert any_repo.get_run(first["run_id"], workspace_id=DEMO_WORKSPACE_ID).merchant_id == DEMO_WORKSPACE_ID
     second = service.scan_revenue(n_total=20, seed=3, merchant_id="demo_two")
-    assert any_repo.get_run(second["run_id"]).merchant_id == "demo_two"
+    assert any_repo.get_run(second["run_id"], workspace_id="demo_two").merchant_id == "demo_two"
+    assert any_repo.get_active_run(workspace_id=DEMO_WORKSPACE_ID).run_id == first["run_id"]   # one scan never moves the other
     again = service.scan_revenue(n_total=20, seed=3)
     assert again["reused_existing_run"] and again["run_id"] == first["run_id"]
 
@@ -366,12 +369,12 @@ def test_the_scan_endpoint_answers_workspace_refusals_with_typed_errors():
 
     merchant = uid("acme")
     routes.repo.create_workspace(new_workspace(merchant, "merchant", "Acme Retail"))
-    active_before = routes.repo.get_active_run()
+    active_before = routes.repo.get_active_run(workspace_id=merchant)
     resp = client.post("/api/scan", json={"n_total": 10, "seed": 1, "merchant_id": merchant})
     assert resp.status_code == 409 and resp.json()["code"] == "synthetic_data_not_allowed"
     assert isinstance(resp.json()["detail"], str) and resp.json()["workspace_id"] == merchant
-    after = routes.repo.get_active_run()
-    assert (after.run_id if after else None) == (active_before.run_id if active_before else None)
+    assert active_before is None and routes.repo.get_active_run(workspace_id=merchant) is None
+    assert routes.repo.list_runs(workspace_id=merchant) == []
 
 
 def test_the_scan_endpoint_still_scans_the_default_demo_workspace():

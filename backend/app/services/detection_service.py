@@ -158,7 +158,7 @@ class DetectionService:
                 )
             return self._open_case(obligation, p, now_iso)
 
-        case = self.repo.get_case(obligation.case_id)  # row-locked on a database
+        case = self.repo.get_case(obligation.case_id, workspace_id=obligation.merchant_id)  # row-locked on a database
         if case.state == CaseState.RESOLVED_AT_SOURCE:
             return DetectionResult(
                 DetectionOutcome.REOPEN_REFUSED, obligation.obligation_id, case.case_id,
@@ -258,7 +258,7 @@ class DetectionService:
 
     def _refresh_case(self, obligation: RevenueObligation, case: RecoveryCase, p: ObligationProjection) -> DetectionResult:
         fresh = self._transaction_from(obligation, p, case.run_id)
-        current = self.repo.get_transaction_by_id(case.transaction_id, case.run_id)
+        current = self.repo.get_transaction_by_id(case.transaction_id, case.run_id, workspace_id=case.merchant_id)
         changed_fields = [
             name for name in (
                 "customer_id", "amount", "payment_method", "failure_code", "retries_so_far", "event_time",
@@ -281,7 +281,7 @@ class DetectionService:
                 DetectionOutcome.NOT_AT_RISK, obligation.obligation_id,
                 reason=f"The source reports this object {p.status}; no case was ever opened.",
             )
-        case = self.repo.get_case(obligation.case_id)  # row-locked on a database
+        case = self.repo.get_case(obligation.case_id, workspace_id=obligation.merchant_id)  # row-locked on a database
         if case.state == CaseState.RESOLVED_AT_SOURCE:
             return DetectionResult(DetectionOutcome.UNCHANGED, obligation.obligation_id, case.case_id)
         if case.state not in _REVISABLE:

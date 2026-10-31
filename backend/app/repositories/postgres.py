@@ -43,7 +43,15 @@ from backend.app.domain.models import (
     ScanRun,
     Transaction,
 )
-from backend.app.domain.workspaces import Workspace, WorkspaceAlreadyExists, require_demo_workspace, validate_new_workspace
+from backend.app.domain.workspaces import (
+    ExecutionNotAvailable,
+    UnknownWorkspace,
+    Workspace,
+    WorkspaceAlreadyExists,
+    WorkspaceMismatch,
+    require_demo_workspace,
+    validate_new_workspace,
+)
 from backend.app.repositories.base import BaseRepository
 from backend.app.repositories.errors import (
     DuplicateIdempotencyKey,
@@ -398,8 +406,33 @@ _CASE_COLUMNS = (
 # SQLSTATEs the database raises when it aborts a transaction in a way a retry cures.
 _TRANSIENT_SQLSTATES = frozenset({"40P01", "40001"})  # deadlock_detected, serialization_failure
 
-_ACTIVE_RUN = "(SELECT run_id FROM scan_runs WHERE status = 'active')"
+# Scans are serialized PER WORKSPACE: two workspaces register and activate runs independently, one workspace's
+# scans queue behind each other (they supersede that workspace's active run, nothing else).
 _SCAN_REGISTRY_LOCK = "revora:scan_registry"
+
+
+def _translate_ownership_error(exc: BaseException) -> Optional[Exception]:
+    """
+    A typed error for a refusal that comes from one of migration 0004's ownership rules, or None.
+    The message is generic on purpose: the driver's own text names the offending key values.
+    """
+    if not isinstance(exc, psycopg2.IntegrityError):
+        return None
+    if "ws_execution_not_available" in str(exc):
+        return ExecutionNotAvailable(
+            "This workspace does not allow execution; the database refused to start an attempt for it."
+        )
+    diag = getattr(exc, "diag", None)
+    name = getattr(diag, "constraint_name", None) or ""
+    if name.endswith("_workspace_fk"):  # a workspace id that is not in the registry
+        return UnknownWorkspace(
+            f"A record names a workspace that is not registered (rule {name}); nothing was stored."
+        )
+    if name.startswith("ws_"):
+        return WorkspaceMismatch(
+            f"A record names a different workspace than the record it belongs to (rule {name}); nothing was stored."
+        )
+    return None
 
 
 def _tx_values(tx: Transaction, ordinal: int) -> Tuple[Any, ...]:
@@ -502,6 +535,9 @@ class PostgresRepository(BaseRepository):
                     raise TransientStorageError(
                         f"The database aborted this unit of work ({exc.pgcode}); it was rolled back and may be retried."
                     ) from exc
+                typed = _translate_ownership_error(exc)
+                if typed is not None:
+                    raise typed from exc
                 raise
             finally:
                 self._local.conn = None
@@ -526,13 +562,29 @@ class PostgresRepository(BaseRepository):
             )
 
     @staticmethod
-    def _run_filter(run_id: Optional[str], column: str = "run_id") -> Tuple[str, List[Any]]:
-        """None -> the active run; ALL_RUNS -> no filter; otherwise that run."""
+    def _scope(workspace_id: str, run_id: Optional[str], column: str = "run_id") -> Tuple[str, List[Any]]:
+        """
+        The run filter of one workspace. There is no unscoped form: a missing workspace is a bug, not "everything".
+          None     -> the workspace's active run (matches nothing if it has none)
+          ALL_RUNS -> every run of the workspace
+          run id   -> that run, only if the workspace owns it
+        """
+        if not workspace_id:
+            raise ValueError("workspace_id is required: there is no implicit workspace and no global active run.")
         if run_id == ALL_RUNS:
-            return "TRUE", []
+            return f"{column} IN (SELECT run_id FROM scan_runs WHERE merchant_id = %s)", [workspace_id]
         if run_id:
-            return f"{column} = %s", [run_id]
-        return f"{column} = {_ACTIVE_RUN}", []
+            return (
+                f"({column} = %s AND {column} IN (SELECT run_id FROM scan_runs WHERE merchant_id = %s))",
+                [run_id, workspace_id],
+            )
+        return f"{column} = (SELECT run_id FROM scan_runs WHERE merchant_id = %s AND status = 'active')", [workspace_id]
+
+    @staticmethod
+    def _require_workspace(workspace_id: str) -> str:
+        if not workspace_id:
+            raise ValueError("workspace_id is required: there is no implicit workspace and no global active run.")
+        return workspace_id
 
     # ── workspaces ───────────────────────────────────────────────────────
     def get_workspace(self, workspace_id: str) -> Optional[Workspace]:
@@ -577,17 +629,30 @@ class PostgresRepository(BaseRepository):
         for case in cases:
             if case.run_id != run.run_id:
                 raise ValueError(f"Case {case.case_id} belongs to run {case.run_id}, not {run.run_id}.")
+        for child in (*transactions, *cases):  # rows under a run name that run's workspace (also a database rule)
+            if child.merchant_id != run.merchant_id:
+                raise WorkspaceMismatch(
+                    f"{type(child).__name__} {getattr(child, 'transaction_id', '?')} names workspace "
+                    f"{child.merchant_id!r}, but the run belongs to {run.merchant_id!r}.",
+                    run.merchant_id,
+                )
         with self._cursor() as cur:
-            self._lock_registry(cur)
+            self._lock_registry(cur, run.merchant_id)
             # Synthetic data only in a registered demo workspace. The database refuses the row on its own as well
             # (migration 0003); checking first gives the caller a typed error instead of a constraint violation.
             cur.execute("SELECT * FROM workspaces WHERE workspace_id = %s", (run.merchant_id,))
             row = cur.fetchone()
             require_demo_workspace(_workspace(row) if row else None, run.merchant_id)
-            cur.execute("SELECT run_id FROM scan_runs WHERE source_fingerprint = %s", (run.source_fingerprint,))
+            cur.execute(
+                "SELECT run_id, merchant_id FROM scan_runs WHERE source_fingerprint = %s", (run.source_fingerprint,)
+            )
             existing = cur.fetchone()
             if existing is not None:
-                return self._activate_locked(cur, existing["run_id"]), False
+                if existing["merchant_id"] != run.merchant_id:
+                    raise WorkspaceMismatch(
+                        "That source fingerprint already belongs to a run of another workspace.", run.merchant_id
+                    )
+                return self._activate_locked(cur, existing["run_id"], run.merchant_id), False
 
             for tx in transactions:
                 tx.run_id = run.run_id
@@ -595,7 +660,7 @@ class PostgresRepository(BaseRepository):
             tx_rows = [_tx_values(tx, i) for i, tx in enumerate(transactions)]
             case_rows = [_case_values(case, i) for i, case in enumerate(cases)]
 
-            self._supersede_active_locked(cur, run.created_at)
+            self._supersede_active_locked(cur, run.merchant_id, run.created_at)
             cur.execute(
                 """
                 INSERT INTO scan_runs (run_id, merchant_id, source_fingerprint, n_total, seed, created_at,
@@ -627,25 +692,31 @@ class PostgresRepository(BaseRepository):
             self.scanned, self.analyzed, self.recovered = True, False, False
             return run, True
 
-    def _lock_registry(self, cur) -> None:
-        cur.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))", (_SCAN_REGISTRY_LOCK,))
-
-    def _supersede_active_locked(self, cur, at_iso: str) -> None:
+    def _lock_registry(self, cur, workspace_id: str) -> None:
         cur.execute(
-            "UPDATE scan_runs SET status = 'superseded', superseded_at = %s WHERE status = 'active'",
-            (_ts(at_iso),),
+            "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))", (f"{_SCAN_REGISTRY_LOCK}:{workspace_id}",)
         )
 
-    def _activate_locked(self, cur, run_id: str) -> ScanRun:
-        cur.execute("SELECT kind, status FROM scan_runs WHERE run_id = %s FOR UPDATE", (run_id,))
+    def _supersede_active_locked(self, cur, workspace_id: str, at_iso: str) -> None:
+        cur.execute(
+            "UPDATE scan_runs SET status = 'superseded', superseded_at = %s "
+            "WHERE status = 'active' AND merchant_id = %s",
+            (_ts(at_iso), workspace_id),
+        )
+
+    def _activate_locked(self, cur, run_id: str, workspace_id: str) -> ScanRun:
+        cur.execute(
+            "SELECT kind, status FROM scan_runs WHERE run_id = %s AND merchant_id = %s FOR UPDATE",
+            (run_id, workspace_id),
+        )
         row = cur.fetchone()
-        if row is None:
+        if row is None:  # unknown, or another workspace's run: indistinguishable on purpose
             raise KeyError(f"Unknown scan run {run_id}.")
         if row["kind"] != "synthetic_scan":
             raise ValueError(f"Run {run_id} is an {row['kind']} run and cannot be activated.")
         now = datetime.now(timezone.utc)
         if row["status"] != "active":
-            self._supersede_active_locked(cur, now.isoformat())
+            self._supersede_active_locked(cur, workspace_id, now.isoformat())
             cur.execute(
                 "UPDATE scan_runs SET status = 'active', superseded_at = NULL WHERE run_id = %s", (run_id,)
             )
@@ -655,40 +726,53 @@ class PostgresRepository(BaseRepository):
         )
         return _run(cur.fetchone())
 
-    def find_run_by_fingerprint(self, fingerprint: str) -> Optional[ScanRun]:
+    def find_run_by_fingerprint(self, fingerprint: str, *, workspace_id: str) -> Optional[ScanRun]:
         with self._cursor() as cur:
-            cur.execute("SELECT * FROM scan_runs WHERE source_fingerprint = %s", (fingerprint,))
+            cur.execute(
+                "SELECT * FROM scan_runs WHERE source_fingerprint = %s AND merchant_id = %s",
+                (fingerprint, self._require_workspace(workspace_id)),
+            )
             row = cur.fetchone()
             return _run(row) if row else None
 
-    def activate_run(self, run_id: str) -> ScanRun:
+    def activate_run(self, run_id: str, *, workspace_id: str) -> ScanRun:
         with self._cursor() as cur:
-            self._lock_registry(cur)
-            return self._activate_locked(cur, run_id)
+            self._lock_registry(cur, self._require_workspace(workspace_id))
+            return self._activate_locked(cur, run_id, workspace_id)
 
-    def get_active_run(self) -> Optional[ScanRun]:
+    def get_active_run(self, *, workspace_id: str) -> Optional[ScanRun]:
         # Inside atomic() take a shared lock: a scan that would supersede this run must wait for us.
         lock = " FOR SHARE" if self._in_atomic() else ""
         with self._cursor() as cur:
-            cur.execute(f"SELECT * FROM scan_runs WHERE status = 'active'{lock}")
+            cur.execute(
+                f"SELECT * FROM scan_runs WHERE merchant_id = %s AND status = 'active'{lock}",
+                (self._require_workspace(workspace_id),),
+            )
             row = cur.fetchone()
             return _run(row) if row else None
 
-    def get_run(self, run_id: str) -> Optional[ScanRun]:
+    def get_run(self, run_id: str, *, workspace_id: str) -> Optional[ScanRun]:
         with self._cursor() as cur:
-            cur.execute("SELECT * FROM scan_runs WHERE run_id = %s", (run_id,))
+            cur.execute(
+                "SELECT * FROM scan_runs WHERE run_id = %s AND merchant_id = %s",
+                (run_id, self._require_workspace(workspace_id)),
+            )
             row = cur.fetchone()
             return _run(row) if row else None
 
-    def list_runs(self) -> List[ScanRun]:
+    def list_runs(self, *, workspace_id: str) -> List[ScanRun]:
         with self._cursor() as cur:
-            cur.execute("SELECT * FROM scan_runs ORDER BY seq")
+            cur.execute(
+                "SELECT * FROM scan_runs WHERE merchant_id = %s ORDER BY seq", (self._require_workspace(workspace_id),)
+            )
             return [_run(r) for r in cur.fetchall()]
 
     # ── transactions ─────────────────────────────────────────────────────
-    def get_transaction_by_id(self, tx_id: str, run_id: Optional[str] = None) -> Optional[Transaction]:
-        scope = None if run_id == ALL_RUNS else run_id
-        clause, params = self._run_filter(scope)
+    def get_transaction_by_id(
+        self, tx_id: str, run_id: Optional[str] = None, *, workspace_id: str
+    ) -> Optional[Transaction]:
+        scope = None if run_id == ALL_RUNS else run_id  # an id resolves inside ONE run: the active one unless named
+        clause, params = self._scope(workspace_id, scope)
         with self._cursor() as cur:
             cur.execute(
                 f"""
@@ -701,8 +785,8 @@ class PostgresRepository(BaseRepository):
             row = cur.fetchone()
             return _tx(row) if row else None
 
-    def get_all_transactions(self, run_id: Optional[str] = None) -> List[Transaction]:
-        clause, params = self._run_filter(run_id, "t.run_id")
+    def get_all_transactions(self, run_id: Optional[str] = None, *, workspace_id: str) -> List[Transaction]:
+        clause, params = self._scope(workspace_id, run_id, "t.run_id")
         with self._cursor() as cur:
             cur.execute(
                 f"""
@@ -714,22 +798,23 @@ class PostgresRepository(BaseRepository):
             return [_tx(r) for r in cur.fetchall()]
 
     def update_transaction_analysis(
-        self, run_id: str, transaction_id: str, model_recovery_prob: Optional[float], contacts_today: Optional[int]
+        self, run_id: str, transaction_id: str, model_recovery_prob: Optional[float], contacts_today: Optional[int],
+        *, workspace_id: str,
     ) -> None:
         with self._cursor() as cur:
             cur.execute(
                 """
                 UPDATE transactions
                 SET model_recovery_prob = %s, contacts_today = COALESCE(%s, contacts_today)
-                WHERE run_id = %s AND transaction_id = %s
+                WHERE run_id = %s AND transaction_id = %s AND merchant_id = %s
                 """,
-                (model_recovery_prob, contacts_today, run_id, transaction_id),
+                (model_recovery_prob, contacts_today, run_id, transaction_id, self._require_workspace(workspace_id)),
             )
             if cur.rowcount == 0:
                 raise KeyError(f"Unknown transaction {transaction_id} in run {run_id}.")
 
     def update_transaction_analyses(
-        self, run_id: str, rows: Sequence[Tuple[str, Optional[float], Optional[int]]]
+        self, run_id: str, rows: Sequence[Tuple[str, Optional[float], Optional[int]]], *, workspace_id: str
     ) -> None:
         rows = list(rows)
         if not rows:
@@ -744,14 +829,14 @@ class PostgresRepository(BaseRepository):
                 UPDATE transactions AS t
                 SET model_recovery_prob = v.prob, contacts_today = COALESCE(v.contacts, t.contacts_today)
                 FROM (VALUES {values_sql}) AS v (transaction_id, prob, contacts)
-                WHERE t.run_id = %s AND t.transaction_id = v.transaction_id
+                WHERE t.run_id = %s AND t.merchant_id = %s AND t.transaction_id = v.transaction_id
                 """,
-                params + [run_id],
+                params + [run_id, self._require_workspace(workspace_id)],
             )
             if cur.rowcount != len(rows):
                 raise KeyError(f"Expected to update {len(rows)} transactions in run {run_id}, updated {cur.rowcount}.")
 
-    def lock_cases(self, run_id: str, transaction_ids: Sequence[str]) -> List[RecoveryCase]:
+    def lock_cases(self, run_id: str, transaction_ids: Sequence[str], *, workspace_id: str) -> List[RecoveryCase]:
         ids = list(transaction_ids)
         if not ids:
             return []
@@ -759,8 +844,9 @@ class PostgresRepository(BaseRepository):
             raise RuntimeError("lock_cases must be called inside atomic().")
         with self._cursor() as cur:
             cur.execute(
-                "SELECT * FROM recovery_cases WHERE run_id = %s AND transaction_id = ANY(%s) ORDER BY ordinal FOR UPDATE",
-                (run_id, ids),
+                "SELECT * FROM recovery_cases WHERE run_id = %s AND merchant_id = %s AND transaction_id = ANY(%s) "
+                "ORDER BY ordinal FOR UPDATE",
+                (run_id, self._require_workspace(workspace_id), ids),
             )
             return [_case(r) for r in cur.fetchall()]
 
@@ -774,36 +860,49 @@ class PostgresRepository(BaseRepository):
                     attempt_count = %s, active_attempt_id = %s, recovered_attempt_id = %s, recovered_amount = %s,
                     outcome_status = %s, blocked_reason = %s, safe_alternative = %s, history = %s, updated_at = %s,
                     version = version + 1
-                WHERE case_id = %s AND version = %s
+                WHERE case_id = %s AND version = %s AND merchant_id = %s AND run_id = %s
                 """,
                 (
                     case.state.value, case.decision_id, case.authorized_action, _j(case.authorization),
                     case.policy_version, case.attempt_count, case.active_attempt_id, case.recovered_attempt_id,
                     to_money(case.recovered_amount), case.outcome_status, case.blocked_reason,
                     case.safe_alternative, _j(case.history), _ts(case.updated_at), case.case_id, case.version,
+                    case.merchant_id, case.run_id,
                 ),
             )
             if cur.rowcount == 0:
-                cur.execute("SELECT version FROM recovery_cases WHERE case_id = %s", (case.case_id,))
+                cur.execute(
+                    "SELECT version, merchant_id, run_id FROM recovery_cases WHERE case_id = %s", (case.case_id,)
+                )
                 current = cur.fetchone()
                 if current is None:
                     raise KeyError(f"Unknown case {case.case_id}; cases are created by register_scan_run.")
+                if (current["merchant_id"], current["run_id"]) != (case.merchant_id, case.run_id):
+                    raise WorkspaceMismatch(
+                        f"Case {case.case_id} cannot be saved under a different workspace or run than it belongs to.",
+                        case.merchant_id,
+                    )
                 raise StaleWrite(
                     f"Case {case.case_id} was changed by another unit of work (read version {case.version}, "
                     f"stored version {current['version']}); the save was refused."
                 )
             case.version += 1  # the object now matches what is stored, so a later save in the same unit is valid
 
-    def get_case(self, case_id: str) -> Optional[RecoveryCase]:
+    def get_case(self, case_id: str, *, workspace_id: str) -> Optional[RecoveryCase]:
         lock = " FOR UPDATE" if self._in_atomic() else ""
         with self._cursor() as cur:
-            cur.execute(f"SELECT * FROM recovery_cases WHERE case_id = %s{lock}", (case_id,))
+            cur.execute(
+                f"SELECT * FROM recovery_cases WHERE case_id = %s AND merchant_id = %s{lock}",
+                (case_id, self._require_workspace(workspace_id)),
+            )
             row = cur.fetchone()
             return _case(row) if row else None
 
-    def get_case_for_transaction(self, key: str, run_id: Optional[str] = None) -> Optional[RecoveryCase]:
+    def get_case_for_transaction(
+        self, key: str, run_id: Optional[str] = None, *, workspace_id: str
+    ) -> Optional[RecoveryCase]:
         scope = None if run_id == ALL_RUNS else run_id
-        clause, params = self._run_filter(scope)
+        clause, params = self._scope(workspace_id, scope)
         lock = " FOR UPDATE" if self._in_atomic() else ""
         with self._cursor() as cur:
             cur.execute(
@@ -817,8 +916,8 @@ class PostgresRepository(BaseRepository):
             row = cur.fetchone()
             return _case(row) if row else None
 
-    def list_cases(self, run_id: Optional[str] = None) -> List[RecoveryCase]:
-        clause, params = self._run_filter(run_id, "c.run_id")
+    def list_cases(self, run_id: Optional[str] = None, *, workspace_id: str) -> List[RecoveryCase]:
+        clause, params = self._scope(workspace_id, run_id, "c.run_id")
         with self._cursor() as cur:
             cur.execute(
                 f"""
@@ -852,25 +951,33 @@ class PostgresRepository(BaseRepository):
             )
             # DO NOTHING: a decision is immutable once written. A re-save is a no-op, never a rewrite.
 
-    def get_decision(self, key: str) -> Optional[Decision]:
+    def get_decision(self, key: str, *, workspace_id: str) -> Optional[Decision]:
+        self._require_workspace(workspace_id)
         with self._cursor() as cur:
-            cur.execute("SELECT * FROM decisions WHERE decision_id = %s", (key,))
+            cur.execute(  # a decision belongs to a workspace through its case
+                """
+                SELECT d.* FROM decisions d JOIN recovery_cases c ON c.case_id = d.case_id
+                WHERE d.decision_id = %s AND c.merchant_id = %s
+                """,
+                (key, workspace_id),
+            )
             row = cur.fetchone()
             if row:
                 return _decision(row)
+            clause, params = self._scope(workspace_id, None, "c.run_id")
             cur.execute(
                 f"""
                 SELECT d.* FROM decisions d JOIN recovery_cases c ON c.decision_id = d.decision_id
-                WHERE c.run_id = {_ACTIVE_RUN} AND (c.transaction_id = %s OR c.leak_id = %s)
+                WHERE {clause} AND (c.transaction_id = %s OR c.leak_id = %s)
                 ORDER BY (c.transaction_id = %s) DESC LIMIT 1
                 """,
-                (key, key, key),
+                params + [key, key, key],
             )
             row = cur.fetchone()
             return _decision(row) if row else None
 
-    def get_all_decisions(self, run_id: Optional[str] = None) -> List[Decision]:
-        clause, params = self._run_filter(run_id, "c.run_id")
+    def get_all_decisions(self, run_id: Optional[str] = None, *, workspace_id: str) -> List[Decision]:
+        clause, params = self._scope(workspace_id, run_id, "c.run_id")
         with self._cursor() as cur:
             cur.execute(
                 f"""
@@ -883,8 +990,8 @@ class PostgresRepository(BaseRepository):
             )
             return [_decision(r) for r in cur.fetchall()]
 
-    def get_escalations(self, run_id: Optional[str] = None) -> List[Decision]:
-        return [d for d in self.get_all_decisions(run_id) if d.final_action == "escalate"]
+    def get_escalations(self, run_id: Optional[str] = None, *, workspace_id: str) -> List[Decision]:
+        return [d for d in self.get_all_decisions(run_id, workspace_id=workspace_id) if d.final_action == "escalate"]
 
     # ── attempt ledger ───────────────────────────────────────────────────
     def save_attempt(self, attempt: ExecutionAttempt):
@@ -917,20 +1024,27 @@ class PostgresRepository(BaseRepository):
             # Identity columns (case, action, authorization, numbering) are written once and never
             # remapped; only the outcome columns above move.
 
-    def get_attempt(self, attempt_id: str) -> Optional[ExecutionAttempt]:
+    def get_attempt(self, attempt_id: str, *, workspace_id: str) -> Optional[ExecutionAttempt]:
         with self._cursor() as cur:
-            cur.execute("SELECT * FROM execution_attempts WHERE attempt_id = %s", (attempt_id,))
+            cur.execute(
+                "SELECT * FROM execution_attempts WHERE attempt_id = %s AND merchant_id = %s",
+                (attempt_id, self._require_workspace(workspace_id)),
+            )
             row = cur.fetchone()
             return _attempt(row) if row else None
 
     def list_attempts(
-        self, case_id: Optional[str] = None, run_id: Optional[str] = None
+        self, case_id: Optional[str] = None, run_id: Optional[str] = None, *, workspace_id: str
     ) -> List[ExecutionAttempt]:
+        self._require_workspace(workspace_id)
         with self._cursor() as cur:
             if case_id is not None:
-                cur.execute("SELECT * FROM execution_attempts WHERE case_id = %s ORDER BY sequence", (case_id,))
+                cur.execute(
+                    "SELECT * FROM execution_attempts WHERE case_id = %s AND merchant_id = %s ORDER BY sequence",
+                    (case_id, workspace_id),
+                )
             else:
-                clause, params = self._run_filter(run_id)
+                clause, params = self._scope(workspace_id, run_id)
                 cur.execute(f"SELECT * FROM execution_attempts WHERE {clause} ORDER BY seq", params)
             return [_attempt(r) for r in cur.fetchall()]
 
@@ -942,10 +1056,11 @@ class PostgresRepository(BaseRepository):
             )
             return [_attempt(r) for r in cur.fetchall()]
 
-    def list_attempts_since(self, created_since: str) -> List[ExecutionAttempt]:
+    def list_attempts_since(self, created_since: str, *, workspace_id: str) -> List[ExecutionAttempt]:
         with self._cursor() as cur:
             cur.execute(
-                "SELECT * FROM execution_attempts WHERE created_at >= %s ORDER BY seq", (_ts(created_since),)
+                "SELECT * FROM execution_attempts WHERE merchant_id = %s AND created_at >= %s ORDER BY seq",
+                (self._require_workspace(workspace_id), _ts(created_since)),
             )
             return [_attempt(r) for r in cur.fetchall()]
 
@@ -1036,14 +1151,17 @@ class PostgresRepository(BaseRepository):
                 ),
             )
 
-    def get_intervention_by_id(self, intervention_id: str) -> Optional[Intervention]:
+    def get_intervention_by_id(self, intervention_id: str, *, workspace_id: str) -> Optional[Intervention]:
         with self._cursor() as cur:
-            cur.execute("SELECT * FROM interventions WHERE intervention_id = %s", (intervention_id,))
+            cur.execute(
+                "SELECT * FROM interventions WHERE intervention_id = %s AND merchant_id = %s",
+                (intervention_id, self._require_workspace(workspace_id)),
+            )
             row = cur.fetchone()
             return _intervention(row) if row else None
 
-    def get_all_interventions(self, run_id: Optional[str] = None) -> List[Intervention]:
-        clause, params = self._run_filter(run_id)
+    def get_all_interventions(self, run_id: Optional[str] = None, *, workspace_id: str) -> List[Intervention]:
+        clause, params = self._scope(workspace_id, run_id)
         with self._cursor() as cur:
             cur.execute(f"SELECT * FROM interventions WHERE {clause} ORDER BY seq", params)
             return [_intervention(r) for r in cur.fetchall()]
@@ -1074,16 +1192,18 @@ class PostgresRepository(BaseRepository):
         status: Optional[str],
         transaction_id: Optional[str],
         run_id: Optional[str],
+        workspace_id: str,
     ) -> Tuple[str, List[Any]]:
-        clauses: List[str] = []
-        params: List[Any] = []
+        clauses: List[str] = ["merchant_id = %s"]  # an audit event belongs to exactly one workspace
+        params: List[Any] = [self._require_workspace(workspace_id)]
         if run_id != ALL_RUNS:
             # Events written without a run stay visible, as in the in-memory repository.
             if run_id:
                 clauses.append("(run_id IS NULL OR run_id = %s)")
                 params.append(run_id)
             else:
-                clauses.append(f"(run_id IS NULL OR run_id = {_ACTIVE_RUN})")
+                clauses.append("(run_id IS NULL OR run_id = (SELECT run_id FROM scan_runs WHERE merchant_id = %s AND status = 'active'))")
+                params.append(workspace_id)
             # No active run at all -> nothing to show (in-memory returns []), but run-less events remain.
         if leak_type:
             clauses.append("(starts_with(leak_id, %s) OR action = %s)")
@@ -1096,12 +1216,15 @@ class PostgresRepository(BaseRepository):
             params.append(transaction_id)
         return (" AND ".join(clauses) or "TRUE"), params
 
-    def _no_scope(self, run_id: Optional[str]) -> bool:
-        """True when the caller asked for the active run and there is none."""
+    def _no_scope(self, run_id: Optional[str], workspace_id: str) -> bool:
+        """True when the caller asked for the workspace's active run and it has none."""
         if run_id:
             return False
         with self._cursor() as cur:
-            cur.execute("SELECT 1 FROM scan_runs WHERE status = 'active'")
+            cur.execute(
+                "SELECT 1 FROM scan_runs WHERE merchant_id = %s AND status = 'active'",
+                (self._require_workspace(workspace_id),),
+            )
             return cur.fetchone() is None
 
     def get_audit_log(
@@ -1112,10 +1235,12 @@ class PostgresRepository(BaseRepository):
         transaction_id: Optional[str] = None,
         newest_first: bool = False,
         run_id: Optional[str] = None,
+        *,
+        workspace_id: str,
     ) -> List[AuditEvent]:
-        if self._no_scope(run_id):
+        if self._no_scope(run_id, workspace_id):
             return []
-        where, params = self._audit_where(leak_type, status, transaction_id, run_id)
+        where, params = self._audit_where(leak_type, status, transaction_id, run_id, workspace_id)
         order = "DESC" if newest_first else "ASC"
         with self._cursor() as cur:
             cur.execute(f"SELECT * FROM audit_events WHERE {where} ORDER BY seq {order} LIMIT %s", params + [limit])
@@ -1127,10 +1252,12 @@ class PostgresRepository(BaseRepository):
         status: Optional[str] = None,
         transaction_id: Optional[str] = None,
         run_id: Optional[str] = None,
+        *,
+        workspace_id: str,
     ) -> Dict[str, Any]:
-        if self._no_scope(run_id):
+        if self._no_scope(run_id, workspace_id):
             return {"matched": 0, "counts_by_type": {}}
-        where, params = self._audit_where(leak_type, status, transaction_id, run_id)
+        where, params = self._audit_where(leak_type, status, transaction_id, run_id, workspace_id)
         with self._cursor() as cur:
             cur.execute(
                 f"SELECT event_type, count(*) AS n FROM audit_events WHERE {where} GROUP BY event_type", params
@@ -1142,6 +1269,11 @@ class PostgresRepository(BaseRepository):
     def get_or_create_ingestion_run(self, merchant_id: str, now_iso: str) -> ScanRun:
         fingerprint = f"ingest:{merchant_id}"
         with self._cursor() as cur:
+            cur.execute("SELECT 1 FROM workspaces WHERE workspace_id = %s", (merchant_id,))
+            if cur.fetchone() is None:  # never for an unverified claim, and never creating the workspace
+                raise UnknownWorkspace(
+                    f"Workspace {merchant_id!r} does not exist. Workspaces are never created implicitly.", merchant_id
+                )
             cur.execute("SELECT * FROM scan_runs WHERE source_fingerprint = %s", (fingerprint,))
             row = cur.fetchone()
             if row is None:
@@ -1162,19 +1294,25 @@ class PostgresRepository(BaseRepository):
                 raise ValueError(f"Fingerprint {fingerprint} belongs to a {row['kind']} run.")
             return _run(row)
 
-    def _lock_ingestion_run(self, cur, run_id: str) -> None:
-        cur.execute("SELECT kind FROM scan_runs WHERE run_id = %s FOR UPDATE", (run_id,))
+    def _lock_ingestion_run(self, cur, run_id: str, workspace_id: str) -> None:
+        cur.execute("SELECT kind, merchant_id FROM scan_runs WHERE run_id = %s FOR UPDATE", (run_id,))
         row = cur.fetchone()
         if row is None:
             raise KeyError(f"Unknown scan run {run_id}.")
         if row["kind"] != "ingestion":
             raise ValueError(f"Run {run_id} is a {row['kind']} run; only an ingestion run accepts event-derived records.")
+        if row["merchant_id"] != workspace_id:  # also a database rule (ws_* foreign keys)
+            raise WorkspaceMismatch(
+                f"Run {run_id} belongs to another workspace than the record being added to it.", workspace_id
+            )
 
     def create_case(self, case: RecoveryCase, transaction: Transaction) -> None:
         if transaction.run_id != case.run_id or transaction.transaction_id != case.transaction_id:
             raise ValueError("Case and transaction do not describe the same record.")
         with self._cursor() as cur:
-            self._lock_ingestion_run(cur, case.run_id)
+            self._lock_ingestion_run(cur, case.run_id, case.merchant_id)
+            if transaction.merchant_id != case.merchant_id:
+                raise WorkspaceMismatch("A case and its transaction must name the same workspace.", case.merchant_id)
             cur.execute(
                 "SELECT COALESCE(MAX(ordinal) + 1, 0) AS n FROM transactions WHERE run_id = %s", (case.run_id,)
             )
@@ -1192,20 +1330,21 @@ class PostgresRepository(BaseRepository):
 
     def update_source_transaction(self, transaction: Transaction) -> None:
         with self._cursor() as cur:
-            self._lock_ingestion_run(cur, transaction.run_id)
+            self._lock_ingestion_run(cur, transaction.run_id, transaction.merchant_id)
             cur.execute(
                 """
                 UPDATE transactions SET
                     customer_id = %s, amount = %s, payment_method = %s, failure_code = %s,
                     retries_so_far = %s, hours_since_event = %s, age_days = %s, event_time = %s,
                     payment_id = %s, consecutive_failures = %s
-                WHERE run_id = %s AND transaction_id = %s
+                WHERE run_id = %s AND transaction_id = %s AND merchant_id = %s
                 """,
                 (
                     transaction.customer_id, to_money(transaction.amount), transaction.payment_method,
                     transaction.failure_code, transaction.retries_so_far, transaction.hours_since_event,
                     transaction.age_days, transaction.event_time, transaction.payment_id,
                     transaction.consecutive_failures, transaction.run_id, transaction.transaction_id,
+                    transaction.merchant_id,
                 ),
             )
             if cur.rowcount == 0:
@@ -1271,23 +1410,24 @@ class PostgresRepository(BaseRepository):
                 )
             return _event(existing), False
 
-    def get_source_event(self, event_id: str) -> Optional[SourceEvent]:
+    def get_source_event(self, event_id: str, *, workspace_id: str) -> Optional[SourceEvent]:
         with self._cursor() as cur:
-            cur.execute("SELECT * FROM source_events WHERE event_id = %s", (event_id,))
+            cur.execute(
+                "SELECT * FROM source_events WHERE event_id = %s AND merchant_id = %s",
+                (event_id, self._require_workspace(workspace_id)),
+            )
             row = cur.fetchone()
             return _event(row) if row else None
 
     def list_source_events(
         self,
-        merchant_id: Optional[str] = None,
         processing_status: Optional[str] = None,
         source: Optional[str] = None,
         limit: int = 100,
+        *,
+        workspace_id: str,
     ) -> List[SourceEvent]:
-        clauses, params = ["TRUE"], []  # type: List[str], List[Any]
-        if merchant_id:
-            clauses.append("merchant_id = %s")
-            params.append(merchant_id)
+        clauses, params = ["merchant_id = %s"], [self._require_workspace(workspace_id)]  # type: List[str], List[Any]
         if processing_status:
             clauses.append("processing_status = %s")
             params.append(processing_status)
@@ -1314,13 +1454,14 @@ class PostgresRepository(BaseRepository):
             return [_event(r) for r in cur.fetchall()]
 
     def mark_source_event(
-        self, event_id: str, processing_status: str, failure_reason: Optional[str], processed_at: str
+        self, event_id: str, processing_status: str, failure_reason: Optional[str], processed_at: str,
+        *, workspace_id: str,
     ) -> None:
         with self._cursor() as cur:
             cur.execute(
                 "UPDATE source_events SET processing_status = %s, failure_reason = %s, processed_at = %s "
-                "WHERE event_id = %s",
-                (processing_status, failure_reason, _ts(processed_at), event_id),
+                "WHERE event_id = %s AND merchant_id = %s",
+                (processing_status, failure_reason, _ts(processed_at), event_id, self._require_workspace(workspace_id)),
             )
             if cur.rowcount == 0:
                 raise KeyError(f"Unknown source event {event_id}.")
@@ -1365,7 +1506,7 @@ class PostgresRepository(BaseRepository):
                     payment_method = %s, first_at_risk_at = %s, last_at_risk_at = %s, due_at = %s,
                     settled_at = %s, event_count = %s, last_event_at = %s, run_id = %s, case_id = %s,
                     settled_while_frozen = %s, last_evaluated_at = %s
-                WHERE obligation_id = %s
+                WHERE obligation_id = %s AND merchant_id = %s
                 """,
                 (
                     obligation.status, obligation.customer_ref, obligation.amount_minor, obligation.currency,
@@ -1374,24 +1515,25 @@ class PostgresRepository(BaseRepository):
                     _ts(obligation.last_at_risk_at), _ts(obligation.due_at), _ts(obligation.settled_at),
                     obligation.event_count, _ts(obligation.last_event_at), obligation.run_id, obligation.case_id,
                     obligation.settled_while_frozen, _ts(obligation.last_evaluated_at), obligation.obligation_id,
+                    obligation.merchant_id,
                 ),
             )
             if cur.rowcount == 0:
                 raise KeyError(f"Unknown obligation {obligation.obligation_id}.")
 
-    def get_obligation(self, obligation_id: str) -> Optional[RevenueObligation]:
+    def get_obligation(self, obligation_id: str, *, workspace_id: str) -> Optional[RevenueObligation]:
         with self._cursor() as cur:
-            cur.execute("SELECT * FROM revenue_obligations WHERE obligation_id = %s", (obligation_id,))
+            cur.execute(
+                "SELECT * FROM revenue_obligations WHERE obligation_id = %s AND merchant_id = %s",
+                (obligation_id, self._require_workspace(workspace_id)),
+            )
             row = cur.fetchone()
             return _obligation(row) if row else None
 
     def list_obligations(
-        self, merchant_id: Optional[str] = None, status: Optional[str] = None, limit: int = 100
+        self, status: Optional[str] = None, limit: int = 100, *, workspace_id: str
     ) -> List[RevenueObligation]:
-        clauses, params = ["TRUE"], []  # type: List[str], List[Any]
-        if merchant_id:
-            clauses.append("merchant_id = %s")
-            params.append(merchant_id)
+        clauses, params = ["merchant_id = %s"], [self._require_workspace(workspace_id)]  # type: List[str], List[Any]
         if status:
             clauses.append("status = %s")
             params.append(status)

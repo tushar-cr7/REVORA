@@ -13,6 +13,15 @@ authorization against *current* state immediately before anything is executed:
 
 Individual execution and bulk recovery both go through `ExecutionService.execute`.
 
+Workspace gate (Phase 3.1). Before ANYTHING else (before a decision is recorded for an undecided case, before a
+reservation, before a provider) the request must name a registered workspace whose execution mode is `simulation`
+and matches the provider that would run. A `recommend_only` workspace (every merchant workspace) is refused with
+ExecutionNotAvailable, an unknown one with UnknownWorkspace; neither writes a thing. The case is then resolved INSIDE
+that workspace only (another workspace's case id is "not found"), and the check is repeated authoritatively inside the
+reservation unit of work together with the case / run / transaction ownership. PostgreSQL adds a trigger on
+execution_attempts (migration 0004) as the last line of defence. The workspace id is what the caller selected; it is
+not authentication.
+
 Atomic boundaries (each is one `repo.atomic()` unit of work; on PostgreSQL, one transaction)
   1. RESERVE  - lock the case; idempotency lookup + request fingerprint; state guard; lock the
                 customer; current ledger facts; strict policy; insert the attempt (reserved, or
@@ -60,6 +69,7 @@ from backend.app.domain.models import (
     new_id,
 )
 from backend.app.domain.policy import POLICY_VERSION, PolicyLimits, PolicyResult, evaluate_policy_strict
+from backend.app.domain.workspaces import ExecutionMode, ExecutionNotAvailable, UnknownWorkspace, Workspace
 from backend.app.integrations.base import PaymentExecutionProvider
 from backend.app.repositories.base import BaseRepository
 from backend.app.repositories.errors import DuplicateIdempotencyKey, run_with_retry
@@ -190,6 +200,7 @@ class ExecutionOutcome:
 
 @dataclass
 class _Reservation:
+    workspace_id: str
     case_id: str
     attempt_id: str
     decision: Any
@@ -272,7 +283,7 @@ class ExecutionService:
         facts = tx.to_dict()
 
         if ledger is None:
-            ledger = self.repo.list_attempts(case_id=case.case_id)
+            ledger = self.repo.list_attempts(case_id=case.case_id, workspace_id=case.merchant_id)
         counted = [a for a in ledger if a.status in COUNTED_ATTEMPT_STATUSES]
         retries = [a for a in counted if a.final_action == Action.RETRY.value]
         facts["retries_so_far"] = None if tx.retries_so_far is None else tx.retries_so_far + len(retries)
@@ -316,18 +327,46 @@ class ExecutionService:
         }
 
     # ── entry point ──────────────────────────────────────────────────────
+    def require_executable_workspace(self, workspace_id: str) -> Workspace:
+        """
+        The workspace gate. Returns the workspace only if it is registered, in `simulation` mode, and that mode is
+        the one of the provider that would run; otherwise raises (UnknownWorkspace / ExecutionNotAvailable). It
+        fails CLOSED: anything that cannot be verified is a refusal. Writes nothing, so it is safe to call first.
+        """
+        workspace = self.repo.get_workspace(workspace_id) if workspace_id else None
+        if workspace is None:
+            raise UnknownWorkspace(
+                f"Workspace {workspace_id!r} does not exist. Workspaces are never created implicitly.", workspace_id
+            )
+        if workspace.execution_mode != ExecutionMode.SIMULATION.value:
+            raise ExecutionNotAvailable(
+                f"Workspace {workspace_id!r} is {workspace.execution_mode}: REVORA recommends and explains here, "
+                "but nothing is executed for it (no provider is connected).",
+                workspace_id,
+            )
+        provider_mode = self._provider_source().execution_mode
+        if provider_mode != workspace.execution_mode:
+            raise ExecutionNotAvailable(
+                f"The provider runs in {provider_mode!r} mode but workspace {workspace_id!r} is "
+                f"{workspace.execution_mode!r}; execution is refused rather than guessed.",
+                workspace_id,
+            )
+        return workspace
+
     def execute(
         self,
+        workspace_id: str,
         target_id: str,
         idempotency_key: Optional[str] = None,
         expected_action: Optional[str] = None,
     ) -> ExecutionOutcome:
+        self.require_executable_workspace(workspace_id)  # first: before a key is read, a case is found or decided
         key = self._normalize_key(idempotency_key)
-        case = self._resolve_case(target_id)
+        case = self._resolve_case(workspace_id, target_id)
         if case.state == CaseState.OPEN:
             case = self._decide_case(case)  # model inference, deliberately outside any transaction
 
-        reserved = self._reserve_with_retry(case.case_id, key, expected_action)
+        reserved = self._reserve_with_retry(workspace_id, case.case_id, key, expected_action)
         if isinstance(reserved, _Refusal):  # committed first, raised now
             raise reserved.error
         if isinstance(reserved, ExecutionOutcome):  # idempotent replay
@@ -345,13 +384,19 @@ class ExecutionService:
             raise IdempotencyKeyInvalid(f"Idempotency key longer than {MAX_IDEMPOTENCY_KEY_LENGTH} characters.")
         return key
 
-    def _resolve_case(self, target_id: str) -> RecoveryCase:
-        """A transaction id or leak id (resolved in the active run) or a case id (any run)."""
+    def _resolve_case(self, workspace_id: str, target_id: str) -> RecoveryCase:
+        """
+        A transaction id or leak id (resolved in the workspace's active run) or a case id (any run of the
+        workspace). Another workspace's ids are not found: the answer is the same as for an id that never existed.
+        """
         with self.repo.atomic():
-            case = self.repo.get_case_for_transaction(target_id) or self.repo.get_case(target_id)
-            if case is None:
+            case = (
+                self.repo.get_case_for_transaction(target_id, workspace_id=workspace_id)
+                or self.repo.get_case(target_id, workspace_id=workspace_id)
+            )
+            if case is None or case.merchant_id != workspace_id:
                 raise CaseNotFound(f"Transaction/leak ID {target_id} not found.")
-            active = self.repo.get_active_run()
+            active = self.repo.get_active_run(workspace_id=workspace_id)
             if active is None or case.run_id != active.run_id:
                 raise StaleRun(
                     f"Case {case.case_id} belongs to scan run {case.run_id}, which is no longer the active run.",
@@ -361,15 +406,15 @@ class ExecutionService:
             return case
 
     # ── phase 1: validate, authorize, reserve (one unit of work) ─────────
-    def _reserve_with_retry(self, case_id: str, key: Optional[str], expected_action: Optional[str]):
+    def _reserve_with_retry(self, workspace_id: str, case_id: str, key: Optional[str], expected_action: Optional[str]):
         # A dead reservation is closed in its OWN unit of work, committed before the reservation is
         # attempted: if it shared the reservation's, any refusal raised afterwards (a replay of the
         # stored failure, say) would roll the recovery back and it would never stick.
         with self.repo.atomic():
-            self._reclaim_if_stale(self.repo.get_case(case_id))
+            self._reclaim_if_stale(self.repo.get_case(case_id, workspace_id=workspace_id))
         for _ in range(_MAX_RESERVE_ROUNDS):
             try:
-                return run_with_retry(lambda: self._reserve(case_id, key, expected_action))
+                return run_with_retry(lambda: self._reserve(workspace_id, case_id, key, expected_action))
             except DuplicateIdempotencyKey:
                 # Another request created this key between our lookup and our insert. Our unit of
                 # work was rolled back whole (no attempt, no case change, no audit event survives);
@@ -379,17 +424,28 @@ class ExecutionService:
             "A request with this Idempotency-Key is still being processed.", case_id=case_id
         )
 
-    def _reserve(self, case_id: str, key: Optional[str], expected_action: Optional[str]):
+    def _reserve(self, workspace_id: str, case_id: str, key: Optional[str], expected_action: Optional[str]):
         with self.repo.atomic():
-            case = self.repo.get_case(case_id)  # row-locked on a database
-            active = self.repo.get_active_run()
+            # Authoritative gate, inside the unit that reserves: the mode is read again under the same
+            # transaction that will write the attempt, and the case / run / transaction must all agree on the
+            # workspace. Anything that does not is refused before an attempt exists, never repaired.
+            self.require_executable_workspace(workspace_id)
+            case = self.repo.get_case(case_id, workspace_id=workspace_id)  # row-locked on a database
+            if case is None:
+                raise CaseNotFound(f"Case {case_id} not found.")
+            active = self.repo.get_active_run(workspace_id=workspace_id)
             if active is None or case.run_id != active.run_id:  # a scan landed after resolution
                 raise StaleRun(
                     f"Case {case.case_id} belongs to scan run {case.run_id}, which is no longer the active run.",
                     case_id=case.case_id,
                     run_id=case.run_id,
                 )
-            tx = self.repo.get_transaction_by_id(case.transaction_id, case.run_id)
+            tx = self.repo.get_transaction_by_id(case.transaction_id, case.run_id, workspace_id=workspace_id)
+            if tx is None or not (case.merchant_id == active.merchant_id == tx.merchant_id == workspace_id):
+                raise ExecutionNotAvailable(
+                    "The workspace, run and case of this request do not agree; execution is refused rather than guessed.",
+                    workspace_id,
+                )
             fingerprint = request_fingerprint(case.merchant_id, case.case_id, expected_action)
 
             # 1. Idempotency: the same key + same request replays; the same key + a
@@ -422,7 +478,7 @@ class ExecutionService:
                     f"Case is already {case.state.value}; no further automated action is allowed.",
                     case_id=case.case_id, case_state=case.state.value,
                 )
-            decision = self.repo.get_decision(case.decision_id) if case.decision_id else None
+            decision = self.repo.get_decision(case.decision_id, workspace_id=workspace_id) if case.decision_id else None
             if case.state == CaseState.OPEN or decision is None:
                 raise CaseConflict(
                     "Case has no decision yet; run /api/analyze first.",
@@ -440,7 +496,7 @@ class ExecutionService:
             #    Contact limits span a customer's cases, so serialize on the customer first.
             self.repo.lock_customer(case.merchant_id, case.customer_id)
             limits = self._policy_source()
-            ledger = self.repo.list_attempts(case_id=case.case_id)
+            ledger = self.repo.list_attempts(case_id=case.case_id, workspace_id=workspace_id)
             facts = self.policy_facts(tx, case, ledger=ledger)
             if requested_action in (Action.SUPPRESS.value, Action.ESCALATE.value):
                 # A hand-off to the merchant or a deliberate no-action moves no money and contacts no
@@ -527,11 +583,13 @@ class ExecutionService:
                 outcome={"status": "started", "attempt_number": attempt.attempt_number},
                 **common,
             )
-            return _Reservation(case_id=case.case_id, attempt_id=attempt.attempt_id, decision=decision, tx=tx)
+            return _Reservation(
+                workspace_id=workspace_id, case_id=case.case_id, attempt_id=attempt.attempt_id, decision=decision, tx=tx
+            )
 
     def _replay(self, record: IdempotencyRecord) -> ExecutionOutcome:
         if record.http_status == 200 and record.response is not None:
-            case = self.repo.get_case(record.case_id)
+            case = self.repo.get_case(record.case_id, workspace_id=record.merchant_id)
             return ExecutionOutcome(
                 intervention=dict(record.response),
                 replayed=True,
@@ -605,7 +663,7 @@ class ExecutionService:
         """
         if case.state != CaseState.EXECUTING or not case.active_attempt_id:
             return case
-        attempt = self.repo.get_attempt(case.active_attempt_id)
+        attempt = self.repo.get_attempt(case.active_attempt_id, workspace_id=case.merchant_id)
         if attempt is None or attempt.status != AttemptStatus.RESERVED:
             return case
         if self.clock() - _parse(attempt.created_at) < self.reservation_timeout:
@@ -635,11 +693,11 @@ class ExecutionService:
         age = self.reservation_timeout if max_age is None else max_age
         cutoff = (self.clock() - age).isoformat()
         closed: List[str] = []
-        for stale in self.repo.list_reserved_attempts(cutoff):
+        for stale in self.repo.list_reserved_attempts(cutoff):  # spans workspaces: each attempt names its own
             try:
                 with self.repo.atomic():
-                    case = self.repo.get_case(stale.case_id)
-                    attempt = self.repo.get_attempt(stale.attempt_id)
+                    case = self.repo.get_case(stale.case_id, workspace_id=stale.merchant_id)
+                    attempt = self.repo.get_attempt(stale.attempt_id, workspace_id=stale.merchant_id)
                     if attempt is None or attempt.status != AttemptStatus.RESERVED:
                         continue
                     self._interrupt_attempt(
@@ -707,7 +765,7 @@ class ExecutionService:
     # ── phase 2 + 3: call the provider outside any transaction, then complete ──
     def _run_and_complete(self, reservation: _Reservation, key: Optional[str]) -> ExecutionOutcome:
         tx, decision = reservation.tx, reservation.decision
-        attempt = self.repo.get_attempt(reservation.attempt_id)
+        attempt = self.repo.get_attempt(reservation.attempt_id, workspace_id=reservation.workspace_id)
         final_action = attempt.final_action
 
         intervention: Optional[Intervention] = None
@@ -775,8 +833,8 @@ class ExecutionService:
 
     def _complete_success(self, reservation, key, intervention: Intervention) -> Union[ExecutionOutcome, ExecutionError]:
         with self.repo.atomic():
-            case = self.repo.get_case(reservation.case_id)
-            attempt = self.repo.get_attempt(reservation.attempt_id)
+            case = self.repo.get_case(reservation.case_id, workspace_id=reservation.workspace_id)
+            attempt = self.repo.get_attempt(reservation.attempt_id, workspace_id=reservation.workspace_id)
             if attempt.status != AttemptStatus.RESERVED:  # reclaimed while the provider call was in flight
                 return self._expired(case, attempt)
             now_iso = self.clock().isoformat()
@@ -847,8 +905,8 @@ class ExecutionService:
 
     def _complete_failure(self, reservation, key, problem: str) -> Union[ExecutionOutcome, ExecutionError]:
         with self.repo.atomic():
-            case = self.repo.get_case(reservation.case_id)
-            attempt = self.repo.get_attempt(reservation.attempt_id)
+            case = self.repo.get_case(reservation.case_id, workspace_id=reservation.workspace_id)
+            attempt = self.repo.get_attempt(reservation.attempt_id, workspace_id=reservation.workspace_id)
             if attempt.status != AttemptStatus.RESERVED:
                 return self._expired(case, attempt)
             now_iso = self.clock().isoformat()
@@ -920,8 +978,8 @@ class ExecutionService:
         """
         try:
             with self.repo.atomic():
-                case = self.repo.get_case(reservation.case_id)
-                attempt = self.repo.get_attempt(reservation.attempt_id)
+                case = self.repo.get_case(reservation.case_id, workspace_id=reservation.workspace_id)
+                attempt = self.repo.get_attempt(reservation.attempt_id, workspace_id=reservation.workspace_id)
                 if attempt.status != AttemptStatus.RESERVED:
                     return
                 self._interrupt_attempt(

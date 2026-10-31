@@ -26,6 +26,7 @@ DEMO_WORKSPACE_ID = "merch_001"
 DEMO_WORKSPACE_NAME = "REVORA demo workspace"
 
 # Same shape as the merchant claim the ingestion contract already accepts (1-128 chars, no control characters).
+# Always applied with `fullmatch`: `$` alone would also accept a value followed by a trailing newline.
 _WORKSPACE_ID = re.compile(r"^[^\x00-\x1f\x7f]{1,128}$")
 _CURRENCY = re.compile(r"^[A-Z]{3}$")
 _NO_CONTROL = re.compile(r"^[^\x00-\x1f\x7f]+$")
@@ -83,6 +84,27 @@ class WorkspaceAlreadyExists(WorkspaceError):
     code = "workspace_exists"
 
 
+class WorkspaceMismatch(WorkspaceError):
+    """
+    A record names one workspace while the record it belongs to (its run, case, attempt...) belongs to another.
+    PostgreSQL refuses these rows with the `ws_*` composite foreign keys of migration 0004; the in-memory
+    repository checks the same ownership where the parent exists.
+    """
+
+    status_code = 409
+    code = "workspace_mismatch"
+
+
+class ExecutionNotAvailable(WorkspaceError):
+    """
+    Nothing may be executed for this workspace: it is `recommend_only`, or its execution mode does not match
+    the provider that would run. Raised before a decision is recorded, an attempt reserved or a provider called.
+    """
+
+    status_code = 409
+    code = "execution_not_available"
+
+
 class SyntheticDataNotAllowed(WorkspaceError):
     """Synthetic demo data was requested for a workspace that is not a demo workspace."""
 
@@ -107,7 +129,7 @@ class Workspace:
 
     def validate(self) -> "Workspace":
         """Raise InvalidWorkspace unless every field is acceptable. The database checks the same rules."""
-        if not isinstance(self.workspace_id, str) or not _WORKSPACE_ID.match(self.workspace_id):
+        if not isinstance(self.workspace_id, str) or not _WORKSPACE_ID.fullmatch(self.workspace_id):
             raise InvalidWorkspace("workspace_id must be 1-128 characters without control characters.", None)
         if self.kind not in {k.value for k in WorkspaceKind}:
             raise InvalidWorkspace(f"kind must be 'demo' or 'merchant', got {self.kind!r}.", self.workspace_id)
@@ -125,16 +147,16 @@ class Workspace:
         if self.origin not in {o.value for o in WorkspaceOrigin}:
             raise InvalidWorkspace(f"Unknown workspace origin {self.origin!r}.", self.workspace_id)
         name = self.display_name
-        if not isinstance(name, str) or not name.strip() or len(name) > MAX_DISPLAY_NAME or not _NO_CONTROL.match(name):
+        if not isinstance(name, str) or not name.strip() or len(name) > MAX_DISPLAY_NAME or not _NO_CONTROL.fullmatch(name):
             raise InvalidWorkspace(
                 f"display_name must be 1-{MAX_DISPLAY_NAME} characters without control characters.", self.workspace_id
             )
-        if not isinstance(self.base_currency, str) or not _CURRENCY.match(self.base_currency):
+        if not isinstance(self.base_currency, str) or not _CURRENCY.fullmatch(self.base_currency):
             raise InvalidWorkspace("base_currency must be an ISO 4217 code such as 'INR'.", self.workspace_id)
         tz = self.timezone
         # Only the shape is checked: the tz database is not reliably installed on every host (Windows), and a
         # check that passes on one machine and fails on another is worse than none. Imports will need more.
-        if not isinstance(tz, str) or not tz.strip() or len(tz) > MAX_TIMEZONE or not _NO_CONTROL.match(tz):
+        if not isinstance(tz, str) or not tz.strip() or len(tz) > MAX_TIMEZONE or not _NO_CONTROL.fullmatch(tz):
             raise InvalidWorkspace(
                 f"timezone must be 1-{MAX_TIMEZONE} characters without control characters.", self.workspace_id
             )

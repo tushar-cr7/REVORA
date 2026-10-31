@@ -62,6 +62,8 @@ class AuditService:
         transaction_id: Optional[str] = None,
         newest_first: bool = False,
         run_id: Optional[str] = None,
+        *,
+        workspace_id: str,
     ) -> List[Dict[str, Any]]:
         events = self.repo.get_audit_log(
             limit=limit,
@@ -70,6 +72,7 @@ class AuditService:
             transaction_id=transaction_id,
             newest_first=newest_first,
             run_id=run_id,
+            workspace_id=workspace_id,
         )
         return [e.to_dict() for e in events]
 
@@ -79,7 +82,10 @@ class AuditService:
         status: Optional[str] = None,
         transaction_id: Optional[str] = None,
         run_id: Optional[str] = None,
+        *,
+        workspace_id: str,
     ) -> Dict[str, Any]:
         return self.repo.summarize_audit_log(
-            leak_type=leak_type, status=status, transaction_id=transaction_id, run_id=run_id
+            leak_type=leak_type, status=status, transaction_id=transaction_id, run_id=run_id,
+            workspace_id=workspace_id,
         )

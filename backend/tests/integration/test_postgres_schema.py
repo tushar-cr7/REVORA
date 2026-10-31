@@ -16,6 +16,7 @@ from backend.app.db import migrate
 from backend.app.repositories.errors import SchemaNotReady
 from backend.app.repositories.postgres import PostgresRepository
 from backend.tests.support import FakeClock, ScriptedProvider, build_service, make_tx
+from backend.tests.support import TEST_WS
 
 TX1, TX2 = "tx_fp_000001", "tx_fp_000002"
 
@@ -36,9 +37,11 @@ def raw(pg_dsn, pg_schema):
 
 
 def test_migrations_apply_in_order_and_are_recorded(pg_dsn, pg_schema, raw):
-    assert migrate.upgrade(pg_dsn, pg_schema) == [1, 2, 3]
+    assert migrate.upgrade(pg_dsn, pg_schema) == [1, 2, 3, 4]
     rows = raw("SELECT version, name, checksum FROM schema_migrations ORDER BY version")
-    assert [(v, n) for v, n, _ in rows] == [(1, "core_recovery_schema"), (2, "event_ingestion"), (3, "workspaces")]
+    assert [(v, n) for v, n, _ in rows] == [
+        (1, "core_recovery_schema"), (2, "event_ingestion"), (3, "workspaces"), (4, "workspace_isolation"),
+    ]
     assert all(len(c) == 64 for _, _, c in rows)
     tables = {r[0] for r in raw("SELECT table_name FROM information_schema.tables WHERE table_schema = current_schema()")}
     assert {"scan_runs", "transactions", "recovery_cases", "decisions", "execution_attempts", "interventions",
@@ -49,17 +52,17 @@ def test_migrations_apply_in_order_and_are_recorded(pg_dsn, pg_schema, raw):
 def test_upgrading_again_is_a_no_op(pg_dsn, pg_schema):
     migrate.upgrade(pg_dsn, pg_schema)
     assert migrate.upgrade(pg_dsn, pg_schema) == []
-    assert migrate.status(pg_dsn, pg_schema) == {"head": 3, "current": 3, "pending": [], "applied": [1, 2, 3]}
+    assert migrate.status(pg_dsn, pg_schema) == {"head": 4, "current": 4, "pending": [], "applied": [1, 2, 3, 4]}
 
 
 def test_a_database_at_an_older_version_upgrades_without_losing_rows(pg_dsn, pg_schema, raw):
     assert migrate.upgrade(pg_dsn, pg_schema, target=1) == [1]
-    assert migrate.status(pg_dsn, pg_schema)["pending"] == [2, 3]
+    assert migrate.status(pg_dsn, pg_schema)["pending"] == [2, 3, 4]
     raw("""INSERT INTO scan_runs (run_id, merchant_id, source_fingerprint, n_total, seed, created_at, last_scanned_at,
                                   status) VALUES ('run_old', 'm', 'fp_old', 1, 7, now(), now(), 'active')""")
     raw("""INSERT INTO transactions (run_id, transaction_id, ordinal, leak_id, merchant_id, customer_id, amount, leak_type,
                                      event_time) VALUES ('run_old', 'tx_1', 0, 'fp_1', 'm', 'c', 100.50, 'failed_payment', 'x')""")
-    assert migrate.upgrade(pg_dsn, pg_schema) == [2, 3]
+    assert migrate.upgrade(pg_dsn, pg_schema) == [2, 3, 4]
     assert raw("SELECT run_id, kind, status FROM scan_runs") == [("run_old", "synthetic_scan", "active")]
     assert raw("SELECT amount FROM transactions")[0][0] == pytest.approx(100.50)
 
@@ -77,7 +80,7 @@ def test_starting_against_the_wrong_schema_version_is_a_clear_error(pg_dsn, pg_s
     with pytest.raises(SchemaNotReady, match="no REVORA schema"):
         PostgresRepository.connect(pg_dsn, schema=pg_schema)           # never migrated
     migrate.upgrade(pg_dsn, pg_schema, target=1)
-    with pytest.raises(SchemaNotReady, match="at version 1 but this code needs 3"):
+    with pytest.raises(SchemaNotReady, match="at version 1 but this code needs 4"):
         PostgresRepository.connect(pg_dsn, schema=pg_schema)           # behind
     migrate.upgrade(pg_dsn, pg_schema)
     raw("INSERT INTO schema_migrations (version, name, checksum) VALUES (99, 'future', 'x')")
@@ -90,7 +93,7 @@ def test_starting_against_the_wrong_schema_version_is_a_clear_error(pg_dsn, pg_s
 def test_auto_migrate_brings_an_empty_database_to_the_current_version(pg_dsn, pg_schema):
     repository = PostgresRepository.connect(pg_dsn, schema=pg_schema, auto_migrate=True)
     try:
-        assert repository.describe()["schema_version"] == 3 == repository.describe()["schema_head"]
+        assert repository.describe()["schema_version"] == 4 == repository.describe()["schema_head"]
     finally:
         repository.close()
 
@@ -124,8 +127,8 @@ def test_concurrent_migrators_apply_each_migration_exactly_once(pg_dsn, pg_schem
     for t in threads:
         t.join(timeout=60)
     assert not errors, errors
-    assert sorted(v for applied in results for v in applied) == [1, 2, 3]    # no migration ran twice
-    assert [v for (v,) in raw("SELECT version FROM schema_migrations ORDER BY version")] == [1, 2, 3]
+    assert sorted(v for applied in results for v in applied) == [1, 2, 3, 4]    # no migration ran twice
+    assert [v for (v,) in raw("SELECT version FROM schema_migrations ORDER BY version")] == [1, 2, 3, 4]
 
 
 def test_crlf_checkouts_do_not_change_a_migrations_identity(tmp_path):
@@ -163,9 +166,9 @@ def seeded(pg_repo, raw):
     """Two analysed cases; TX1 executed and recovered. Returns ids for raw-SQL violations."""
     service = build_service([make_tx(1, amount=1000.0), make_tx(2, amount=2000.0)],
                             provider=ScriptedProvider(["recovered"]), clock=FakeClock(), repo=pg_repo)
-    service.execute_case(TX1, "seed-key")
-    case1, case2 = pg_repo.get_case_for_transaction(TX1), pg_repo.get_case_for_transaction(TX2)
-    attempt = pg_repo.list_attempts(case_id=case1.case_id)[0]
+    service.execute_case(TEST_WS, TX1, "seed-key")
+    case1, case2 = pg_repo.get_case_for_transaction(TX1, workspace_id=TEST_WS), pg_repo.get_case_for_transaction(TX2, workspace_id=TEST_WS)
+    attempt = pg_repo.list_attempts(case_id=case1.case_id, workspace_id=TEST_WS)[0]
     return {
         "run": case1.run_id, "case1": case1.case_id, "case2": case2.case_id, "attempt1": attempt.attempt_id,
         "intervention1": attempt.intervention_id, "decision2": case2.decision_id,
@@ -216,8 +219,13 @@ def test_history_cannot_be_deleted_out_from_under_its_children(raw, seeded):
             raw(f"DELETE FROM {table} WHERE {column} = %s", (value,))
 
 
-def test_only_one_run_can_be_active(raw, seeded):
-    with refused_by(pgerr.UniqueViolation, "scan_runs_one_active"):
+def test_only_one_run_per_workspace_can_be_active(raw, seeded, pg_repo):
+    from backend.app.domain.workspaces import new_workspace
+    pg_repo.create_workspace(new_workspace("other_demo", "demo", "Another demo workspace"))
+    raw("""INSERT INTO scan_runs (run_id, merchant_id, source_fingerprint, n_total, seed, created_at, last_scanned_at,
+                                  status) VALUES ('run_other_ws', 'other_demo', 'fp_other_ws', 1, 1, now(), now(), 'active')""")
+    assert raw("SELECT count(*) FROM scan_runs WHERE status = 'active'") == [(2,)]   # one each: no longer one per database
+    with refused_by(pgerr.UniqueViolation, "scan_runs_one_active_per_workspace"):
         raw("""INSERT INTO scan_runs (run_id, merchant_id, source_fingerprint, n_total, seed, created_at, last_scanned_at,
                                       status) VALUES ('run_second', 'merch_test', 'fp_second', 1, 1, now(), now(), 'active')""")
     with refused_by(pgerr.UniqueViolation, "scan_runs_fingerprint_key"):   # the same source data is one run
@@ -273,9 +281,12 @@ def test_a_case_cannot_be_recovered_twice_even_by_two_different_attempts(raw, se
 def test_an_idempotency_scope_exists_once(raw, seeded):
     with refused_by(pgerr.UniqueViolation, "idempotency_records_pkey"):
         clone(raw, "idempotency_records", "key", "seed-key")
-    # the same key under another merchant or operation is a different scope
-    clone(raw, "idempotency_records", "key", "seed-key", merchant_id="another_merchant")
+    # the same key under another operation is a different scope
     clone(raw, "idempotency_records", "key", "seed-key", operation="another_operation")
+    # ...and under another merchant it WOULD be one (the scope is merchant + operation + key), but a record can no
+    # longer claim a workspace other than its case's (migration 0004), so that scope cannot be built on this case
+    with refused_by(pgerr.ForeignKeyViolation, "ws_idempotency_case_fk"):
+        clone(raw, "idempotency_records", "key", "seed-key", merchant_id="another_merchant")
 
 
 def test_case_rows_cannot_describe_impossible_states(raw, seeded):
@@ -327,6 +338,8 @@ def test_the_audit_log_cannot_be_edited_or_deleted_through_normal_statements(raw
 
 
 def test_event_tables_refuse_unsafe_rows(raw, pg_repo):
+    from backend.app.domain.workspaces import new_workspace
+    pg_repo.create_workspace(new_workspace("m", "merchant", "Events fixture"))   # events belong to a registered workspace
     base = dict(event_id="sev_1", merchant_id="m", source="internal", source_event_id="e1",
                 event_type="payment.attempt_failed", reference_kind="payment", reference_id="o1")
 
@@ -353,6 +366,8 @@ def test_event_tables_refuse_unsafe_rows(raw, pg_repo):
 
 
 def test_the_ingestion_run_can_never_be_active_and_a_scan_can_never_be_standby(raw, pg_repo):
+    from backend.app.domain.workspaces import new_workspace
+    pg_repo.create_workspace(new_workspace("m", "demo", "Run-kind fixture"))     # runs belong to a registered workspace
     with refused_by(pgerr.CheckViolation, "scan_runs_ingestion_is_standby"):
         raw("""INSERT INTO scan_runs (run_id, merchant_id, source_fingerprint, n_total, seed, created_at, last_scanned_at,
                                       status, kind) VALUES ('r', 'm', 'ingest:m', 0, 0, now(), now(), 'active', 'ingestion')""")

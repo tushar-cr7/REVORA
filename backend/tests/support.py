@@ -27,6 +27,11 @@ from backend.app.services.audit_service import AuditService
 from backend.app.services.recovery_service import RecoveryService, scan_fingerprint
 
 
+# The workspace every fixture transaction belongs to (make_tx's default merchant). Tests name it explicitly
+# wherever they read or execute, because the repositories and services have no implicit workspace.
+TEST_WS = "merch_test"
+
+
 class FakeClock:
     """Controllable UTC clock, injected into the execution layer."""
 
@@ -180,7 +185,7 @@ def build_service(
     service.model = FixedProbModel(prob)
     register_run(service, transactions, seed=seed)
     if analyze:
-        service.analyze_revenue()
+        service.analyze_revenue(transactions[0].merchant_id)
     return service
 
 
@@ -225,9 +230,9 @@ def register_run(service: RecoveryService, transactions: List[Transaction], seed
     return run
 
 
-def case_of(service: RecoveryService, tx_id: str) -> RecoveryCase:
-    return service.repo.get_case_for_transaction(tx_id)
+def case_of(service: RecoveryService, tx_id: str, workspace_id: str = TEST_WS) -> RecoveryCase:
+    return service.repo.get_case_for_transaction(tx_id, workspace_id=workspace_id)
 
 
-def ledger(service: RecoveryService, tx_id: str):
-    return service.repo.list_attempts(case_id=case_of(service, tx_id).case_id)
+def ledger(service: RecoveryService, tx_id: str, workspace_id: str = TEST_WS):
+    return service.repo.list_attempts(case_id=case_of(service, tx_id, workspace_id).case_id, workspace_id=workspace_id)

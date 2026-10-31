@@ -46,13 +46,15 @@ from backend.tests.support import (
     make_tx,
     register_run,
 )
+from backend.tests.support import TEST_WS
+from backend.app.domain.workspaces import DEMO_WORKSPACE_ID
 
 TX1 = "tx_fp_000001"
 TX2 = "tx_fp_000002"
 
 
 def audit_types(service, tx_id=None):
-    return [e.event_type for e in service.repo.get_audit_log(limit=10000, transaction_id=tx_id)]
+    return [e.event_type for e in service.repo.get_audit_log(limit=10000, transaction_id=tx_id, workspace_id=TEST_WS)]
 
 
 def widen_race_window(service, seconds=0.02):
@@ -77,18 +79,18 @@ def test_retry_cap_of_two_cannot_be_bypassed_by_repeated_execution():
     clock = FakeClock()
     provider = ScriptedProvider(outcomes=["no_recovery"])
     service = build_service([make_tx(1)], provider=provider, clock=clock)
-    assert service.repo.get_decision(TX1).final_action == "retry"
+    assert service.repo.get_decision(TX1, workspace_id=TEST_WS).final_action == "retry"
 
     # Cap = 2 and the ingested record shows 0 prior retries, so exactly two attempts are legitimate.
     for n in (1, 2):
-        out = service.execute_case(TX1, f"attempt-{n}")
+        out = service.execute_case(TEST_WS, TX1, f"attempt-{n}")
         assert out.intervention["status"] == "attempted_no_recovery"
         clock.advance(hours=7)  # past the 6h cooldown, so only the cap is in play
 
     # The third and every later request is refused, however many fresh keys are used.
     for n in range(3, 12):
         with pytest.raises(PolicyDenied) as denied:
-            service.execute_case(TX1, f"attempt-{n}")
+            service.execute_case(TEST_WS, TX1, f"attempt-{n}")
         assert "Retry limit exceeded (2/2)" in denied.value.message
         assert denied.value.extra["safe_alternative"] == "escalate"
 
@@ -99,32 +101,32 @@ def test_retry_cap_of_two_cannot_be_bypassed_by_repeated_execution():
     statuses = [a.status for a in ledger(service, TX1)]
     assert statuses.count(AttemptStatus.COMPLETED) == 2
     assert statuses.count(AttemptStatus.DENIED) == 9
-    assert len(service.repo.get_all_interventions()) == 2
-    assert service.get_analytics_summary()["total_recovered"] == 0
+    assert len(service.repo.get_all_interventions(workspace_id=TEST_WS)) == 2
+    assert service.get_analytics_summary(TEST_WS)["total_recovered"] == 0
 
 
 def test_a_decision_authorized_earlier_is_not_executable_after_the_policy_tightens():
     provider = ScriptedProvider(["recovered"])
     service = build_service([make_tx(1, amount=8000.0)], provider=provider)
-    decision = service.repo.get_decision(TX1)
+    decision = service.repo.get_decision(TX1, workspace_id=TEST_WS)
     assert decision.policy_allowed and decision.final_action == "retry"
 
     service.policy = replace(DEFAULT_POLICY, max_auto_recovery_value=5000.0)  # constraint changes after analysis
 
     with pytest.raises(PolicyDenied) as denied:
-        service.execute_case(TX1, "k1")
+        service.execute_case(TEST_WS, TX1, "k1")
     assert "auto-recovery ceiling" in denied.value.message
     assert provider.calls == []
-    assert service.repo.get_all_interventions() == []
+    assert service.repo.get_all_interventions(workspace_id=TEST_WS) == []
     case = case_of(service, TX1)
     assert case.state == CaseState.BLOCKED and case.safe_alternative == "escalate"
 
     # Re-analysis refreshes the decision from current policy; only then is the rerouted action runnable.
-    service.analyze_revenue()
-    refreshed = service.repo.get_decision(TX1)
+    service.analyze_revenue(TEST_WS)
+    refreshed = service.repo.get_decision(TX1, workspace_id=TEST_WS)
     assert refreshed.decision_id != decision.decision_id
     assert not refreshed.policy_allowed and refreshed.final_action == "escalate"
-    out = service.execute_case(TX1, "k2")
+    out = service.execute_case(TEST_WS, TX1, "k2")
     assert out.intervention["status"] == "escalated_to_merchant"
     assert [c["action"] for c in provider.calls] == ["escalate"]
     assert case_of(service, TX1).state == CaseState.ESCALATED
@@ -137,23 +139,23 @@ def test_a_policy_denied_action_never_reaches_the_provider_and_is_audited_once()
     before = audit_types(service, TX1)
 
     with pytest.raises(PolicyDenied):
-        service.execute_case(TX1, "denied-key")
+        service.execute_case(TEST_WS, TX1, "denied-key")
     assert provider.calls == []
 
     new_events = audit_types(service, TX1)[len(before):]
     assert new_events == ["ACTION_BLOCKED"]
-    event = service.repo.get_audit_log(limit=10000, transaction_id=TX1)[-1]
+    event = service.repo.get_audit_log(limit=10000, transaction_id=TX1, workspace_id=TEST_WS)[-1]
     assert event.outcome["status"] == "denied_at_execution"
     assert event.policy_result["allowed"] is False
     assert event.case_id == case_of(service, TX1).case_id and event.attempt_id
 
     # A replay of the denied request returns the same refusal and writes nothing new.
-    count = len(service.repo.get_audit_log(limit=10000))
+    count = len(service.repo.get_audit_log(limit=10000, workspace_id=TEST_WS))
     ledger_len = len(ledger(service, TX1))
     with pytest.raises(ReplayedExecutionError) as again:
-        service.execute_case(TX1, "denied-key")
+        service.execute_case(TEST_WS, TX1, "denied-key")
     assert again.value.status_code == 409 and again.value.code == "policy_denied" and again.value.replayed
-    assert len(service.repo.get_audit_log(limit=10000)) == count
+    assert len(service.repo.get_audit_log(limit=10000, workspace_id=TEST_WS)) == count
     assert len(ledger(service, TX1)) == ledger_len
     assert provider.calls == []
 
@@ -161,13 +163,13 @@ def test_a_policy_denied_action_never_reaches_the_provider_and_is_audited_once()
 def test_missing_safety_critical_data_fails_closed_at_execution():
     provider = ScriptedProvider(["recovered"])
     service = build_service([make_tx(1)], provider=provider)
-    assert service.repo.get_decision(TX1).final_action == "retry"
+    assert service.repo.get_decision(TX1, workspace_id=TEST_WS).final_action == "retry"
 
     # The figure disappears after the decision was made (bad re-sync, partial record, ...).
-    service.repo.get_transaction_by_id(TX1).retries_so_far = None
+    service.repo.get_transaction_by_id(TX1, workspace_id=TEST_WS).retries_so_far = None
 
     with pytest.raises(PolicyDenied) as denied:
-        service.execute_case(TX1, "k1")
+        service.execute_case(TEST_WS, TX1, "k1")
     assert "retries_so_far" in denied.value.message and "failing closed" in denied.value.message
     assert provider.calls == []
     assert case_of(service, TX1).state == CaseState.BLOCKED
@@ -177,12 +179,12 @@ def test_missing_data_at_ingestion_is_not_defaulted_to_a_permissive_zero():
     provider = ScriptedProvider(["recovered"])
     service = build_service([make_tx(1, retries_so_far=None)], provider=provider)  # analysed with the gap present
 
-    decision = service.repo.get_decision(TX1)
+    decision = service.repo.get_decision(TX1, workspace_id=TEST_WS)
     assert not decision.policy_allowed
     assert "Missing or invalid safety-critical input" in decision.policy_reason
     assert decision.final_action == "escalate"  # rerouted to a person, never silently retried
 
-    out = service.execute_case(TX1, "k1")
+    out = service.execute_case(TEST_WS, TX1, "k1")
     assert out.intervention["status"] == "escalated_to_merchant"
     assert [c["action"] for c in provider.calls] == ["escalate"]
 
@@ -196,38 +198,38 @@ def test_hand_offs_and_no_action_are_always_executable_so_no_case_is_stranded():
     """
     provider = ScriptedProvider(["recovered"])
     service = build_service([make_tx(1, amount=40000.0, hours_since_event=2)], provider=provider)
-    decision = service.repo.get_decision(TX1)
+    decision = service.repo.get_decision(TX1, workspace_id=TEST_WS)
     assert decision.ai_proposed_action == "retry" and decision.final_action == "suppress"
     assert not decision.policy_allowed and "Cooldown" in decision.policy_reason
 
-    out = service.execute_case(TX1, "k")
+    out = service.execute_case(TEST_WS, TX1, "k")
     assert out.intervention["status"] == "suppressed" and out.intervention["recovered_amount"] == 0.0
     assert case_of(service, TX1).state == CaseState.SUPPRESSED
     assert [c["action"] for c in provider.calls] == ["suppress"]
-    assert service.get_analytics_summary()["total_recovered"] == 0
+    assert service.get_analytics_summary(TEST_WS)["total_recovered"] == 0
 
 
 def test_escalation_is_executable_even_when_safety_inputs_are_missing():
     provider = ScriptedProvider(["recovered"])
     service = build_service([make_tx(1, amount=40000.0)], provider=provider)   # over the ceiling -> escalate
-    tx = service.repo.get_transaction_by_id(TX1)
+    tx = service.repo.get_transaction_by_id(TX1, workspace_id=TEST_WS)
     tx.retries_so_far = tx.hours_since_event = None                              # data gap discovered later
-    out = service.execute_case(TX1, "k")
+    out = service.execute_case(TEST_WS, TX1, "k")
     assert out.intervention["status"] == "escalated_to_merchant"
     assert case_of(service, TX1).state == CaseState.ESCALATED
 
 
 def test_read_only_paths_tolerate_a_record_with_a_data_gap():
     service = build_service([make_tx(1), make_tx(2, retries_so_far=None, hours_since_event=None)])
-    sim = service.simulate_policy(DEFAULT_POLICY)           # counts the gap as blocked, does not crash
+    sim = service.simulate_policy(TEST_WS, DEFAULT_POLICY)           # counts the gap as blocked, does not crash
     assert sim["total_transactions"] == 2 and sim["blocked_count"] >= 1
-    answer = service.copilot_query("diagnose", transaction_id="tx_fp_000002")
+    answer = service.copilot_query(TEST_WS, "diagnose", transaction_id="tx_fp_000002")
     assert "unknown" in answer["answer"] and answer["key_metrics"]["policy_allowed"] is False
 
 
 def test_subscription_missing_failure_count_fails_closed():
     service = build_service([make_tx(1, leak_type="failed_subscription", amount=900.0, consecutive_failures=None)])
-    decision = service.repo.get_decision("tx_fs_000001")
+    decision = service.repo.get_decision("tx_fs_000001", workspace_id=TEST_WS)
     assert not decision.policy_allowed and "consecutive_failures" in decision.policy_reason
 
 
@@ -238,37 +240,37 @@ def test_replay_with_the_same_key_creates_no_attempt_and_no_extra_recovery():
     provider = ScriptedProvider(["recovered"])
     service = build_service([make_tx(1, amount=2500.0)], provider=provider)
 
-    first = service.execute_case(TX1, "same-key")
-    events_after_first = len(service.repo.get_audit_log(limit=10000))
-    summary = service.get_analytics_summary()
+    first = service.execute_case(TEST_WS, TX1, "same-key")
+    events_after_first = len(service.repo.get_audit_log(limit=10000, workspace_id=TEST_WS))
+    summary = service.get_analytics_summary(TEST_WS)
     assert first.intervention["recovered_amount"] == 2500.0 and not first.replayed
 
     for _ in range(5):
-        replay = service.execute_case(TX1, "same-key")
+        replay = service.execute_case(TEST_WS, TX1, "same-key")
         assert replay.replayed
         assert replay.intervention == first.intervention  # the original result, verbatim
 
     assert len(provider.calls) == 1
     assert len(ledger(service, TX1)) == 1
-    assert len(service.repo.get_all_interventions()) == 1
-    assert len(service.repo.get_audit_log(limit=10000)) == events_after_first  # replays add no audit events
-    assert service.get_analytics_summary() == summary
+    assert len(service.repo.get_all_interventions(workspace_id=TEST_WS)) == 1
+    assert len(service.repo.get_audit_log(limit=10000, workspace_id=TEST_WS)) == events_after_first  # replays add no audit events
+    assert service.get_analytics_summary(TEST_WS) == summary
     assert summary["total_recovered"] == 2500.0 and summary["recovered_count"] == 1
 
 
 def test_distinct_keys_cannot_recover_the_same_case_twice():
     provider = ScriptedProvider(["recovered"])
     service = build_service([make_tx(1, amount=2500.0)], provider=provider)
-    service.execute_case(TX1, "k0")
+    service.execute_case(TEST_WS, TX1, "k0")
 
     for n in range(1, 8):
         with pytest.raises(CaseConflict) as conflict:
-            service.execute_case(TX1, f"k{n}")
+            service.execute_case(TEST_WS, TX1, f"k{n}")
         assert conflict.value.extra["case_state"] == "recovered"
 
     assert len(provider.calls) == 1
     assert len(ledger(service, TX1)) == 1  # refusals before authorization leave no ledger entry
-    stats = service.get_analytics_summary()
+    stats = service.get_analytics_summary(TEST_WS)
     assert stats["total_recovered"] == 2500.0 and stats["recovered_count"] == 1 and stats["attempted_count"] == 1
 
 
@@ -279,17 +281,17 @@ def test_analytics_count_unique_recovery_outcomes_only():
         [make_tx(1, amount=1000.0), make_tx(2, amount=2000.0), make_tx(3, amount=90000.0)],
         provider=provider, clock=clock,
     )
-    service.execute_case(TX1, "a1")           # no recovery
+    service.execute_case(TEST_WS, TX1, "a1")           # no recovery
     clock.advance(hours=7)
-    service.execute_case(TX1, "a2")           # recovered on the second attempt
-    service.execute_case(TX2, "b1")           # recovered
-    service.execute_case("tx_fp_000003", "c1")  # 90000 > ceiling: escalated, not a recovery
+    service.execute_case(TEST_WS, TX1, "a2")           # recovered on the second attempt
+    service.execute_case(TEST_WS, TX2, "b1")           # recovered
+    service.execute_case(TEST_WS, "tx_fp_000003", "c1")  # 90000 > ceiling: escalated, not a recovery
     for n in range(5):                        # hammer the finished cases
-        service.execute_case(TX2, "b1")       # replay
+        service.execute_case(TEST_WS, TX2, "b1")       # replay
         with pytest.raises(CaseConflict):
-            service.execute_case(TX1, f"dup-{n}")
+            service.execute_case(TEST_WS, TX1, f"dup-{n}")
 
-    stats = service.get_analytics_summary()
+    stats = service.get_analytics_summary(TEST_WS)
     assert stats["total_recovered"] == 3000.0   # 1000 + 2000, each counted once
     assert stats["recovered_count"] == 2
     assert stats["attempted_count"] == 3        # three recovery-class attempts ran
@@ -306,22 +308,22 @@ def test_analytics_count_unique_recovery_outcomes_only():
 def test_reusing_a_key_for_a_different_transaction_is_rejected():
     provider = ScriptedProvider(["recovered"])
     service = build_service([make_tx(1), make_tx(2)], provider=provider)
-    first = service.execute_case(TX1, "shared")
+    first = service.execute_case(TEST_WS, TX1, "shared")
 
     with pytest.raises(IdempotencyKeyReuse) as reuse:
-        service.execute_case(TX2, "shared")
+        service.execute_case(TEST_WS, TX2, "shared")
     assert reuse.value.status_code == 422
 
     assert case_of(service, TX2).state == CaseState.AUTHORIZED
     assert ledger(service, TX2) == []
     assert len(provider.calls) == 1
-    assert service.execute_case(TX1, "shared").intervention["intervention_id"] == first.intervention["intervention_id"]
+    assert service.execute_case(TEST_WS, TX1, "shared").intervention["intervention_id"] == first.intervention["intervention_id"]
 
 
 def test_a_transaction_id_and_its_leak_id_are_the_same_target_for_a_key():
     service = build_service([make_tx(1)])
-    first = service.execute_case(TX1, "k")
-    replay = service.execute_case("fp_000001", "k")  # leak id form of the same case
+    first = service.execute_case(TEST_WS, TX1, "k")
+    replay = service.execute_case(TEST_WS, "fp_000001", "k")  # leak id form of the same case
     assert replay.replayed and replay.intervention == first.intervention
 
 
@@ -329,12 +331,12 @@ def test_reusing_a_key_with_a_different_action_or_payload_is_rejected():
     provider = ScriptedProvider(["recovered"])
     service = build_service([make_tx(1)], provider=provider)
 
-    service.execute_case(TX1, "k", expected_action="retry")
-    assert service.execute_case(TX1, "k", expected_action="retry").replayed      # same payload: fine
+    service.execute_case(TEST_WS, TX1, "k", expected_action="retry")
+    assert service.execute_case(TEST_WS, TX1, "k", expected_action="retry").replayed      # same payload: fine
     with pytest.raises(IdempotencyKeyReuse):
-        service.execute_case(TX1, "k", expected_action="payment_link")            # different action
+        service.execute_case(TEST_WS, TX1, "k", expected_action="payment_link")            # different action
     with pytest.raises(IdempotencyKeyReuse):
-        service.execute_case(TX1, "k")                                              # payload dropped
+        service.execute_case(TEST_WS, TX1, "k")                                              # payload dropped
     assert len(provider.calls) == 1
 
 
@@ -342,11 +344,11 @@ def test_expected_action_guards_against_a_changed_recommendation():
     provider = ScriptedProvider(["recovered"])
     service = build_service([make_tx(1)], provider=provider)
     with pytest.raises(ActionMismatch) as mismatch:
-        service.execute_case(TX1, "k", expected_action="payment_link")
+        service.execute_case(TEST_WS, TX1, "k", expected_action="payment_link")
     assert mismatch.value.extra["authorized_action"] == "retry"
     assert provider.calls == [] and ledger(service, TX1) == []
     # A refusal that never reserved anything does not burn the key.
-    assert service.execute_case(TX1, "k", expected_action="retry").intervention["status"] == "recovered"
+    assert service.execute_case(TEST_WS, TX1, "k", expected_action="retry").intervention["status"] == "recovered"
 
 
 def test_idempotency_keys_are_scoped_by_merchant_and_operation():
@@ -361,9 +363,9 @@ def test_idempotency_keys_are_scoped_by_merchant_and_operation():
 def test_blank_keys_are_treated_as_absent_and_oversized_keys_are_refused():
     service = build_service([make_tx(1)])
     with pytest.raises(IdempotencyKeyInvalid):
-        service.execute_case(TX1, "k" * 256)
+        service.execute_case(TEST_WS, TX1, "k" * 256)
     assert ledger(service, TX1) == []
-    out = service.execute_case(TX1, "   ")  # whitespace-only == no key
+    out = service.execute_case(TEST_WS, TX1, "   ")  # whitespace-only == no key
     assert out.intervention["idempotency_key"] is None
 
 
@@ -378,7 +380,7 @@ def test_concurrent_identical_requests_produce_one_execution():
     def worker():
         barrier.wait()
         try:
-            outcome = ("ok", service.execute_case(TX1, "race-key"))
+            outcome = ("ok", service.execute_case(TEST_WS, TX1, "race-key"))
         except Exception as exc:  # noqa: BLE001 - classified below
             outcome = ("err", exc)
         with lock:
@@ -399,8 +401,8 @@ def test_concurrent_identical_requests_produce_one_execution():
 
     assert len(provider.calls) == 1
     assert len(ledger(service, TX1)) == 1
-    assert len(service.repo.get_all_interventions()) == 1
-    stats = service.get_analytics_summary()
+    assert len(service.repo.get_all_interventions(workspace_id=TEST_WS)) == 1
+    stats = service.get_analytics_summary(TEST_WS)
     assert stats["total_recovered"] == 4000.0 and stats["recovered_count"] == 1
 
 
@@ -415,7 +417,7 @@ def test_concurrent_distinct_keys_on_one_case_produce_one_effect():
     def worker(i):
         barrier.wait()
         try:
-            outcome = ("ok", service.execute_case(TX1, f"key-{i}"))
+            outcome = ("ok", service.execute_case(TEST_WS, TX1, f"key-{i}"))
         except Exception as exc:  # noqa: BLE001
             outcome = ("err", exc)
         with lock:
@@ -432,7 +434,7 @@ def test_concurrent_distinct_keys_on_one_case_produce_one_effect():
     assert len(oks) == 1
     assert all(isinstance(e, CaseConflict) for e in errs), errs
     assert len(provider.calls) == 1 and len(ledger(service, TX1)) == 1
-    assert service.get_analytics_summary()["total_recovered"] == 4000.0
+    assert service.get_analytics_summary(TEST_WS)["total_recovered"] == 4000.0
 
 
 def test_an_in_flight_request_is_refused_not_duplicated_and_replays_once_finished():
@@ -442,7 +444,7 @@ def test_an_in_flight_request_is_refused_not_duplicated_and_replays_once_finishe
     result = {}
 
     def slow_request():
-        result["outcome"] = service.execute_case(TX1, "slow-key")
+        result["outcome"] = service.execute_case(TEST_WS, TX1, "slow-key")
 
     thread = threading.Thread(target=slow_request)
     thread.start()
@@ -454,14 +456,14 @@ def test_an_in_flight_request_is_refused_not_duplicated_and_replays_once_finishe
     assert [a.status for a in ledger(service, TX1)] == [AttemptStatus.RESERVED]
 
     with pytest.raises(IdempotencyInProgress):
-        service.execute_case(TX1, "slow-key")      # the same request again
+        service.execute_case(TEST_WS, TX1, "slow-key")      # the same request again
     with pytest.raises(CaseConflict):
-        service.execute_case(TX1, "another-key")   # a different request for the same case
+        service.execute_case(TEST_WS, TX1, "another-key")   # a different request for the same case
     assert len(provider.calls) == 1
 
     gate.set()
     thread.join(timeout=10)
-    replay = service.execute_case(TX1, "slow-key")
+    replay = service.execute_case(TEST_WS, TX1, "slow-key")
     assert replay.replayed and replay.intervention == result["outcome"].intervention
     assert len(provider.calls) == 1 and len(ledger(service, TX1)) == 1
     assert case_of(service, TX1).state == CaseState.RECOVERED
@@ -477,10 +479,10 @@ def test_attempt_ledger_records_authorization_numbering_and_outcomes():
     case = case_of(service, TX1)
     assert case.state == CaseState.AUTHORIZED and case.attempt_count == 0
 
-    service.execute_case(TX1, "a1")
+    service.execute_case(TEST_WS, TX1, "a1")
     assert case.state == CaseState.ATTEMPTED_NO_RECOVERY and case.attempt_count == 1
     clock.advance(hours=7)
-    service.execute_case(TX1, "a2")
+    service.execute_case(TEST_WS, TX1, "a2")
     assert case.state == CaseState.RECOVERED and case.attempt_count == 2
 
     first, second = ledger(service, TX1)
@@ -500,7 +502,7 @@ def test_attempt_ledger_records_authorization_numbering_and_outcomes():
     assert first.provider == "ScriptedProvider" and first.execution_mode == "simulation"
     assert first.decision_id == case.decision_id
 
-    interventions = service.repo.get_all_interventions()
+    interventions = service.repo.get_all_interventions(workspace_id=TEST_WS)
     assert {i.attempt_id for i in interventions} == {first.attempt_id, second.attempt_id}
     assert all(i.case_id == case.case_id and i.run_id == case.run_id for i in interventions)
     assert all(i.execution_mode == "simulation" for i in interventions)
@@ -513,16 +515,16 @@ def test_a_failed_attempt_needs_fresh_policy_authorization_before_it_can_be_retr
     clock = FakeClock()
     provider = ScriptedProvider(["no_recovery", "recovered"])
     service = build_service([make_tx(1)], provider=provider, clock=clock)
-    first = service.execute_case(TX1, "k1")
+    first = service.execute_case(TEST_WS, TX1, "k1")
     assert first.intervention["status"] == "attempted_no_recovery"
 
     # Same key: a replay of attempt 1, not a new attempt.
-    assert service.execute_case(TX1, "k1").replayed
+    assert service.execute_case(TEST_WS, TX1, "k1").replayed
     assert len(provider.calls) == 1
 
     # New key straight away: a new attempt was requested but the cooldown since the last retry holds.
     with pytest.raises(PolicyDenied) as denied:
-        service.execute_case(TX1, "k2")
+        service.execute_case(TEST_WS, TX1, "k2")
     assert "Cooldown not elapsed" in denied.value.message
     assert len(provider.calls) == 1
     assert case_of(service, TX1).state == CaseState.BLOCKED
@@ -530,7 +532,7 @@ def test_a_failed_attempt_needs_fresh_policy_authorization_before_it_can_be_retr
 
     # Once policy is satisfied the same new request is authorized afresh and becomes attempt 2.
     clock.advance(hours=7)
-    second = service.execute_case(TX1, "k3")
+    second = service.execute_case(TEST_WS, TX1, "k3")
     assert second.intervention["status"] == "recovered"
     assert [a.attempt_number for a in ledger(service, TX1) if a.status == AttemptStatus.COMPLETED] == [1, 2]
     assert len(provider.calls) == 2
@@ -542,26 +544,26 @@ def test_a_provider_failure_is_recorded_counted_and_replayable_but_never_a_recov
     service = build_service([make_tx(1)], provider=provider, clock=clock)
 
     with pytest.raises(ProviderFailure) as failure:
-        service.execute_case(TX1, "k1")
+        service.execute_case(TEST_WS, TX1, "k1")
     assert failure.value.status_code == 502
     case = case_of(service, TX1)
     assert case.state == CaseState.ATTEMPTED_NO_RECOVERY and case.attempt_count == 1
     assert case.active_attempt_id is None  # never stranded in "executing"
     (attempt,) = ledger(service, TX1)
     assert attempt.status == AttemptStatus.FAILED and "scripted provider outage" in attempt.failure_reason
-    assert service.repo.get_all_interventions() == []
-    stats = service.get_analytics_summary()
+    assert service.repo.get_all_interventions(workspace_id=TEST_WS) == []
+    stats = service.get_analytics_summary(TEST_WS)
     assert stats["total_recovered"] == 0 and stats["recovered_count"] == 0 and stats["attempted_count"] == 1
     assert "EXECUTION_FAILED" in audit_types(service, TX1) and "EXECUTION_SUCCEEDED" not in audit_types(service, TX1)
 
     with pytest.raises(ReplayedExecutionError) as replayed:   # same key: the stored failure, no second call
-        service.execute_case(TX1, "k1")
+        service.execute_case(TEST_WS, TX1, "k1")
     assert replayed.value.status_code == 502 and len(provider.calls) == 1
 
     with pytest.raises(PolicyDenied):                          # the failed call still counts toward cooldown
-        service.execute_case(TX1, "k2")
+        service.execute_case(TEST_WS, TX1, "k2")
     clock.advance(hours=7)
-    assert service.execute_case(TX1, "k3").intervention["status"] == "recovered"
+    assert service.execute_case(TEST_WS, TX1, "k3").intervention["status"] == "recovered"
 
 
 def test_a_bookkeeping_failure_after_the_provider_call_releases_the_case_and_the_key(caplog):
@@ -574,7 +576,7 @@ def test_a_bookkeeping_failure_after_the_provider_call_releases_the_case_and_the
 
     service.repo.save_intervention = explode            # fault injection: first write after the provider returns
     with pytest.raises(RuntimeError):
-        service.execute_case(TX1, "k1")
+        service.execute_case(TEST_WS, TX1, "k1")
     del service.repo.save_intervention                  # storage recovers
 
     case = case_of(service, TX1)
@@ -582,16 +584,16 @@ def test_a_bookkeeping_failure_after_the_provider_call_releases_the_case_and_the
     (attempt,) = ledger(service, TX1)
     assert attempt.status == AttemptStatus.FAILED and "bookkeeping" in attempt.failure_reason
     assert case.attempt_count == 1                       # the provider call may have happened: it counts
-    assert service.get_analytics_summary()["total_recovered"] == 0
+    assert service.get_analytics_summary(TEST_WS)["total_recovered"] == 0
     assert "execution bookkeeping failed" in caplog.text
 
     with pytest.raises(ReplayedExecutionError) as replayed:   # the key is not stuck "in progress"
-        service.execute_case(TX1, "k1")
+        service.execute_case(TEST_WS, TX1, "k1")
     assert replayed.value.status_code == 500 and replayed.value.code == "execution_bookkeeping_error"
     assert len(provider.calls) == 1
 
     clock.advance(hours=7)                                    # and the case can be retried with fresh authorization
-    assert service.execute_case(TX1, "k2").intervention["status"] == "recovered"
+    assert service.execute_case(TEST_WS, TX1, "k2").intervention["status"] == "recovered"
 
 
 @pytest.mark.parametrize("bad_status", ["recovered_but_wrong_tx", "unknown_status", "wrong_action"])
@@ -609,26 +611,26 @@ def test_an_untrustworthy_provider_result_is_never_recorded_as_a_recovery(bad_st
 
     service = build_service([make_tx(1)], provider=BadProvider(["recovered"]))
     with pytest.raises(ProviderFailure):
-        service.execute_case(TX1, "k")
+        service.execute_case(TEST_WS, TX1, "k")
     assert case_of(service, TX1).state == CaseState.ATTEMPTED_NO_RECOVERY
-    assert service.get_analytics_summary()["total_recovered"] == 0
-    assert service.repo.get_all_interventions() == []
+    assert service.get_analytics_summary(TEST_WS)["total_recovered"] == 0
+    assert service.repo.get_all_interventions(workspace_id=TEST_WS) == []
 
 
 def test_terminal_cases_refuse_further_execution_without_touching_the_ledger():
     provider = ScriptedProvider(["recovered"])
     service = build_service([make_tx(1), make_tx(2, amount=90000.0)], provider=provider)
-    service.execute_case(TX1, "r")       # recovered
-    service.execute_case(TX2, "e")       # escalated (over the ceiling)
-    calls, events = len(provider.calls), len(service.repo.get_audit_log(limit=10000))
+    service.execute_case(TEST_WS, TX1, "r")       # recovered
+    service.execute_case(TEST_WS, TX2, "e")       # escalated (over the ceiling)
+    calls, events = len(provider.calls), len(service.repo.get_audit_log(limit=10000, workspace_id=TEST_WS))
 
     for tx_id, state in ((TX1, "recovered"), (TX2, "escalated")):
         with pytest.raises(CaseConflict) as conflict:
-            service.execute_case(tx_id, "new-key")
+            service.execute_case(TEST_WS, tx_id, "new-key")
         assert conflict.value.extra["case_state"] == state
         assert len(ledger(service, tx_id)) == 1
     assert len(provider.calls) == calls
-    assert len(service.repo.get_audit_log(limit=10000)) == events
+    assert len(service.repo.get_audit_log(limit=10000, workspace_id=TEST_WS)) == events
 
 
 def test_contact_cap_is_enforced_from_the_ledger_not_from_the_decision_time_snapshot():
@@ -638,7 +640,7 @@ def test_contact_cap_is_enforced_from_the_ledger_not_from_the_decision_time_snap
         [make_tx(1, leak_type="abandoned_checkout", customer_id="cust_shared")], provider=provider, clock=clock
     )
     tx_id = "tx_ac_000001"
-    assert service.repo.get_decision(tx_id).final_action == "payment_link"  # allowed when analysed
+    assert service.repo.get_decision(tx_id, workspace_id=TEST_WS).final_action == "payment_link"  # allowed when analysed
 
     # Since analysis, another case reached the same customer (a completed contact on the ledger).
     service.repo.save_attempt(ExecutionAttempt(
@@ -651,12 +653,12 @@ def test_contact_cap_is_enforced_from_the_ledger_not_from_the_decision_time_snap
     ))
 
     with pytest.raises(PolicyDenied) as denied:
-        service.execute_case(tx_id, "k1")
+        service.execute_case(TEST_WS, tx_id, "k1")
     assert "Daily customer contact limit" in denied.value.message
     assert provider.calls == []
 
     clock.advance(hours=25)   # the trailing 24h window has passed
-    assert service.execute_case(tx_id, "k2").intervention["status"] == "recovered"
+    assert service.execute_case(TEST_WS, tx_id, "k2").intervention["status"] == "recovered"
 
 
 def test_a_denied_or_failed_contact_ledger_entry_counts_correctly():
@@ -667,13 +669,13 @@ def test_a_denied_or_failed_contact_ledger_entry_counts_correctly():
         clock=clock,
     )
     # Same customer, one run: the decision-time contact plan allows one contact and reroutes the other.
-    first, second = service.repo.get_decision("tx_ac_000001"), service.repo.get_decision("tx_ac_000002")
+    first, second = service.repo.get_decision("tx_ac_000001", workspace_id=TEST_WS), service.repo.get_decision("tx_ac_000002", workspace_id=TEST_WS)
     assert first.final_action == "payment_link" and first.policy_allowed
     assert second.final_action == "suppress" and "contact limit" in second.policy_reason
 
-    service.execute_case("tx_ac_000001", "k1")
-    service.analyze_revenue()   # re-analysis sees the real contact on the ledger and keeps the plan
-    assert service.repo.get_decision("tx_ac_000002").final_action == "suppress"
+    service.execute_case(TEST_WS, "tx_ac_000001", "k1")
+    service.analyze_revenue(TEST_WS)   # re-analysis sees the real contact on the ledger and keeps the plan
+    assert service.repo.get_decision("tx_ac_000002", workspace_id=TEST_WS).final_action == "suppress"
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -681,24 +683,24 @@ def test_a_denied_or_failed_contact_ledger_entry_counts_correctly():
 # ──────────────────────────────────────────────────────────────────────────
 def test_reanalysis_does_not_churn_decisions_or_duplicate_audit_events():
     service = build_service([make_tx(1), make_tx(2, leak_type="abandoned_checkout", amount=3000.0)])
-    ids = {t: service.repo.get_decision(t).decision_id for t in (TX1, "tx_ac_000002")}
-    events = len(service.repo.get_audit_log(limit=10000))
+    ids = {t: service.repo.get_decision(t, workspace_id=TEST_WS).decision_id for t in (TX1, "tx_ac_000002")}
+    events = len(service.repo.get_audit_log(limit=10000, workspace_id=TEST_WS))
 
     for _ in range(3):
-        service.analyze_revenue()
+        service.analyze_revenue(TEST_WS)
 
-    assert {t: service.repo.get_decision(t).decision_id for t in ids} == ids
-    assert len(service.repo.get_audit_log(limit=10000)) == events
+    assert {t: service.repo.get_decision(t, workspace_id=TEST_WS).decision_id for t in ids} == ids
+    assert len(service.repo.get_audit_log(limit=10000, workspace_id=TEST_WS)) == events
     assert audit_types(service).count("DECISION_CREATED") == 2
 
 
 def test_reanalysis_leaves_cases_with_recorded_outcomes_alone():
     service = build_service([make_tx(1, amount=2000.0)])
-    service.execute_case(TX1, "k")
-    decision_id = service.repo.get_decision(TX1).decision_id
+    service.execute_case(TEST_WS, TX1, "k")
+    decision_id = service.repo.get_decision(TX1, workspace_id=TEST_WS).decision_id
     service.policy = replace(DEFAULT_POLICY, max_retries=0)   # would now block a retry
-    service.analyze_revenue()
-    assert service.repo.get_decision(TX1).decision_id == decision_id
+    service.analyze_revenue(TEST_WS)
+    assert service.repo.get_decision(TX1, workspace_id=TEST_WS).decision_id == decision_id
     assert case_of(service, TX1).state in (CaseState.RECOVERED, CaseState.ATTEMPTED_NO_RECOVERY)
 
 
@@ -707,7 +709,7 @@ def test_a_case_that_was_never_analysed_is_decided_on_demand_as_before():
     service = build_service([make_tx(1)], provider=provider, analyze=False)
     assert case_of(service, TX1).state == CaseState.OPEN
 
-    out = service.execute_case(TX1, "k")
+    out = service.execute_case(TEST_WS, TX1, "k")
     assert out.intervention["status"] == "recovered"
     assert case_of(service, TX1).decision_id is not None and "DECISION_CREATED" in audit_types(service, TX1)
 
@@ -719,15 +721,15 @@ def test_execution_lifecycle_events_are_ordered_attributed_and_never_falsely_suc
     clock = FakeClock()
     service = build_service([make_tx(1), make_tx(2, amount=90000.0)],
                             provider=ScriptedProvider(["no_recovery"]), clock=clock)
-    service.execute_case(TX1, "k1")
-    service.execute_case(TX2, "k2")
+    service.execute_case(TEST_WS, TX1, "k1")
+    service.execute_case(TEST_WS, TX2, "k2")
 
     assert audit_types(service, TX1) == ["DECISION_CREATED", "ACTION_AUTHORIZED", "EXECUTION_STARTED", "EXECUTION_FAILED"]
     assert audit_types(service, TX2) == ["ACTION_BLOCKED", "ACTION_AUTHORIZED", "EXECUTION_STARTED", "ESCALATION_CREATED"]
     assert "EXECUTION_SUCCEEDED" not in audit_types(service)  # nothing recovered, nothing reported as success
 
     case = case_of(service, TX1)
-    exec_events = [e for e in service.repo.get_audit_log(limit=10000, transaction_id=TX1) if e.attempt_id]
+    exec_events = [e for e in service.repo.get_audit_log(limit=10000, transaction_id=TX1, workspace_id=TEST_WS) if e.attempt_id]
     assert {e.attempt_id for e in exec_events} == {ledger(service, TX1)[0].attempt_id}
     assert all(e.case_id == case.case_id and e.run_id == case.run_id for e in exec_events)
     assert exec_events[-1].intervention_id is not None            # existing consumers rely on this
@@ -757,96 +759,96 @@ def test_a_new_scan_cannot_attach_history_to_a_different_transaction():
 
     # The hazard: the same transaction id is a different record (different amount) in the two runs.
     collisions = [
-        t.transaction_id for t in repo.get_all_transactions(run_a)
-        if repo.get_transaction_by_id(t.transaction_id, run_b)
-        and repo.get_transaction_by_id(t.transaction_id, run_b).amount != t.amount
+        t.transaction_id for t in repo.get_all_transactions(run_a, workspace_id=DEMO_WORKSPACE_ID)
+        if repo.get_transaction_by_id(t.transaction_id, run_b, workspace_id=DEMO_WORKSPACE_ID)
+        and repo.get_transaction_by_id(t.transaction_id, run_b, workspace_id=DEMO_WORKSPACE_ID).amount != t.amount
     ]
     assert collisions, "fixture should contain ids whose data differs between scans"
     tx_id = collisions[0]
-    amount_a = repo.get_transaction_by_id(tx_id, run_a).amount
-    amount_b = repo.get_transaction_by_id(tx_id, run_b).amount
+    amount_a = repo.get_transaction_by_id(tx_id, run_a, workspace_id=DEMO_WORKSPACE_ID).amount
+    amount_b = repo.get_transaction_by_id(tx_id, run_b, workspace_id=DEMO_WORKSPACE_ID).amount
 
     # Work happens in run A...
     again = service.scan_revenue(n_total=50, seed=42)
     assert again["run_id"] == run_a and again["reused_existing_run"] and again["superseded_run_id"] == run_b
-    service.analyze_revenue()
-    executed = service.execute_case(tx_id, "run-a-key")
-    case_a = repo.get_case_for_transaction(tx_id)
+    service.analyze_revenue(DEMO_WORKSPACE_ID)
+    executed = service.execute_case(DEMO_WORKSPACE_ID, tx_id, "run-a-key")
+    case_a = repo.get_case_for_transaction(tx_id, workspace_id=DEMO_WORKSPACE_ID)
     assert case_a.run_id == run_a and executed.intervention["amount"] == amount_a
-    decision_a = repo.get_decision(case_a.decision_id)
+    decision_a = repo.get_decision(case_a.decision_id, workspace_id=DEMO_WORKSPACE_ID)
     assert decision_a.run_id == run_a
 
     # ...then run B becomes active. A's history must not follow the id.
     scan_b2 = service.scan_revenue(n_total=100, seed=42)
     assert scan_b2["run_id"] == run_b and scan_b2["reused_existing_run"]
-    case_b = repo.get_case_for_transaction(tx_id)
+    case_b = repo.get_case_for_transaction(tx_id, workspace_id=DEMO_WORKSPACE_ID)
     assert case_b.case_id != case_a.case_id and case_b.run_id == run_b
     assert case_b.state == CaseState.OPEN and case_b.attempt_count == 0 and case_b.decision_id is None
-    assert repo.get_transaction_by_id(tx_id).amount == amount_b != amount_a
-    assert repo.get_decision(tx_id) is None                              # A's decision is not B's
-    assert repo.get_decision(decision_a.decision_id).run_id == run_a     # ...but is still retrievable by id
+    assert repo.get_transaction_by_id(tx_id, workspace_id=DEMO_WORKSPACE_ID).amount == amount_b != amount_a
+    assert repo.get_decision(tx_id, workspace_id=DEMO_WORKSPACE_ID) is None                              # A's decision is not B's
+    assert repo.get_decision(decision_a.decision_id, workspace_id=DEMO_WORKSPACE_ID).run_id == run_a     # ...but is still retrievable by id
 
     # Historical records keep their original relationships.
-    itv = repo.get_intervention_by_id(executed.intervention["intervention_id"])
+    itv = repo.get_intervention_by_id(executed.intervention["intervention_id"], workspace_id=DEMO_WORKSPACE_ID)
     assert itv.run_id == run_a and itv.case_id == case_a.case_id and itv.amount == amount_a
-    assert repo.get_transaction_by_id(itv.transaction_id, itv.run_id).amount == itv.amount
+    assert repo.get_transaction_by_id(itv.transaction_id, itv.run_id, workspace_id=DEMO_WORKSPACE_ID).amount == itv.amount
     assert case_a.state in (CaseState.RECOVERED, CaseState.ATTEMPTED_NO_RECOVERY, CaseState.ESCALATED, CaseState.SUPPRESSED)
 
     # Default reads show only the active run; history stays reachable explicitly.
-    assert service.get_interventions() == []
-    assert len(service.get_interventions(run_id="all")) == 1
-    assert service.get_analytics_summary()["total_recovered"] == 0
-    assert repo.get_audit_log(limit=10000, transaction_id=tx_id) == []
-    assert len(repo.get_audit_log(limit=10000, transaction_id=tx_id, run_id="all")) >= 3
+    assert service.get_interventions(DEMO_WORKSPACE_ID) == []
+    assert len(service.get_interventions(DEMO_WORKSPACE_ID, run_id="all")) == 1
+    assert service.get_analytics_summary(DEMO_WORKSPACE_ID)["total_recovered"] == 0
+    assert repo.get_audit_log(limit=10000, transaction_id=tx_id, workspace_id=DEMO_WORKSPACE_ID) == []
+    assert len(repo.get_audit_log(limit=10000, transaction_id=tx_id, run_id="all", workspace_id=DEMO_WORKSPACE_ID)) >= 3
 
     # B's case runs independently of A's.
-    service.analyze_revenue()
-    out_b = service.execute_case(tx_id, "run-b-key")
+    service.analyze_revenue(DEMO_WORKSPACE_ID)
+    out_b = service.execute_case(DEMO_WORKSPACE_ID, tx_id, "run-b-key")
     assert out_b.case_id == case_b.case_id and out_b.intervention["amount"] == amount_b
-    assert len(repo.list_attempts(case_id=case_a.case_id)) == 1   # A's ledger was not touched by B's execution
-    assert len(ledger(service, tx_id)) == 1                         # ledger() resolves the active run's (B's) case
+    assert len(repo.list_attempts(case_id=case_a.case_id, workspace_id=DEMO_WORKSPACE_ID)) == 1   # A's ledger was not touched by B's execution
+    assert len(ledger(service, tx_id, DEMO_WORKSPACE_ID)) == 1                         # ledger() resolves the active run's (B's) case
 
 
 def test_a_case_from_a_superseded_run_is_not_executable():
     service = _real_scan_service()
     service.scan_revenue(n_total=50, seed=42)
-    service.analyze_revenue()
-    old_case = service.repo.list_cases()[0]
+    service.analyze_revenue(DEMO_WORKSPACE_ID)
+    old_case = service.repo.list_cases(workspace_id=DEMO_WORKSPACE_ID)[0]
     service.scan_revenue(n_total=100, seed=42)
 
     with pytest.raises(StaleRun) as stale:
-        service.execute_case(old_case.case_id, "k")
+        service.execute_case(DEMO_WORKSPACE_ID, old_case.case_id, "k")
     assert stale.value.status_code == 409
-    assert service.repo.list_attempts(case_id=old_case.case_id) == []
+    assert service.repo.list_attempts(case_id=old_case.case_id, workspace_id=DEMO_WORKSPACE_ID) == []
     assert old_case.state != CaseState.EXECUTING
 
 
 def test_repeating_an_identical_scan_keeps_all_state_instead_of_resetting_it():
     service = _real_scan_service()
     service.scan_revenue(n_total=50, seed=42)
-    service.analyze_revenue()
-    tx_id = service.get_opportunities(limit=1)[0]["transaction_id"]
-    service.execute_case(tx_id, "k")
-    case = service.repo.get_case_for_transaction(tx_id)
-    state, attempts, decisions = case.state, len(ledger(service, tx_id)), len(service.repo.get_all_decisions())
+    service.analyze_revenue(DEMO_WORKSPACE_ID)
+    tx_id = service.get_opportunities(DEMO_WORKSPACE_ID, limit=1)[0]["transaction_id"]
+    service.execute_case(DEMO_WORKSPACE_ID, tx_id, "k")
+    case = service.repo.get_case_for_transaction(tx_id, workspace_id=DEMO_WORKSPACE_ID)
+    state, attempts, decisions = case.state, len(ledger(service, tx_id, DEMO_WORKSPACE_ID)), len(service.repo.get_all_decisions(workspace_id=DEMO_WORKSPACE_ID))
 
     for _ in range(3):   # the dashboard re-scans on page loads
         again = service.scan_revenue(n_total=50, seed=42)
-        service.analyze_revenue()
+        service.analyze_revenue(DEMO_WORKSPACE_ID)
         assert again["reused_existing_run"]
 
-    assert service.repo.get_case_for_transaction(tx_id) is case
-    assert (case.state, len(ledger(service, tx_id)), len(service.repo.get_all_decisions())) == (state, attempts, decisions)
-    assert len(service.get_interventions()) == 1
-    assert service.repo.get_active_run().scan_count == 4
+    assert service.repo.get_case_for_transaction(tx_id, workspace_id=DEMO_WORKSPACE_ID) is case
+    assert (case.state, len(ledger(service, tx_id, DEMO_WORKSPACE_ID)), len(service.repo.get_all_decisions(workspace_id=DEMO_WORKSPACE_ID))) == (state, attempts, decisions)
+    assert len(service.get_interventions(DEMO_WORKSPACE_ID)) == 1
+    assert service.repo.get_active_run(workspace_id=DEMO_WORKSPACE_ID).scan_count == 4
     with pytest.raises(CaseConflict):
-        service.execute_case(tx_id, "after-rescan")
+        service.execute_case(DEMO_WORKSPACE_ID, tx_id, "after-rescan")
 
 
 def test_unknown_targets_are_not_found():
     service = build_service([make_tx(1)])
     with pytest.raises(CaseNotFound) as missing:
-        service.execute_case("tx_nope", "k")
+        service.execute_case(TEST_WS, "tx_nope", "k")
     assert isinstance(missing.value, ValueError) and missing.value.status_code == 404
 
 
@@ -867,7 +869,7 @@ def _bulk_fixture(**kw):
 def test_bulk_recovery_twice_does_not_duplicate_anything():
     service, provider = _bulk_fixture()
 
-    first = service.recover_revenue()
+    first = service.recover_revenue(TEST_WS)
     assert first["executed_now"] == 6 and first["skipped_now"] == 0 and first["blocked_now"] == 0
     assert (first["recovered_now"] + first["not_recovered_now"] + first["escalated_now"]
             + first["suppressed_now"]) == first["executed_now"]
@@ -877,15 +879,15 @@ def test_bulk_recovery_twice_does_not_duplicate_anything():
     assert calls == 6
     snapshot = {k: first[k] for k in ("total_recovered", "recovered_count", "attempted_count", "actions_executed")}
 
-    second = service.recover_revenue()
+    second = service.recover_revenue(TEST_WS)
     assert second["executed_now"] == 0 and second["skipped_now"] == 6
     assert len(provider.calls) == calls
     assert {k: second[k] for k in snapshot} == snapshot       # cumulative figures unchanged
-    assert len(service.repo.get_all_interventions()) == 6
-    assert len(service.repo.list_attempts()) == 6
-    assert service.get_analytics_summary()["total_recovered"] == first["total_recovered"]
+    assert len(service.repo.get_all_interventions(workspace_id=TEST_WS)) == 6
+    assert len(service.repo.list_attempts(workspace_id=TEST_WS)) == 6
+    assert service.get_analytics_summary(TEST_WS)["total_recovered"] == first["total_recovered"]
 
-    recovered_amounts = sum(c.amount for c in service.repo.list_cases() if c.state == CaseState.RECOVERED)
+    recovered_amounts = sum(c.amount for c in service.repo.list_cases(workspace_id=TEST_WS) if c.state == CaseState.RECOVERED)
     assert first["total_recovered"] == recovered_amounts
     assert first["total_recovered"] <= first["total_at_risk"]
 
@@ -894,7 +896,7 @@ def test_bulk_recovery_applies_execution_time_policy_to_every_case():
     service, provider = _bulk_fixture()
     service.policy = replace(DEFAULT_POLICY, max_auto_recovery_value=2500.0)  # tightened after analysis
 
-    result = service.recover_revenue()
+    result = service.recover_revenue(TEST_WS)
     # Cases whose stale decision is now above the ceiling are denied at execution and never reach the
     # provider. The invoice already rerouted to escalation stays executable: handing it to a person is safe.
     assert result["blocked_now"] == 3 and result["executed_now"] == 3
@@ -902,27 +904,27 @@ def test_bulk_recovery_applies_execution_time_policy_to_every_case():
     assert result["escalated_now"] == 1
     assert result["policy_violations"] == 0
 
-    denied = lambda: [a for a in service.repo.list_attempts() if a.status == AttemptStatus.DENIED]  # noqa: E731
+    denied = lambda: [a for a in service.repo.list_attempts(workspace_id=TEST_WS) if a.status == AttemptStatus.DENIED]  # noqa: E731
     assert len(denied()) == 3
-    audit_after_first = len(service.repo.get_audit_log(limit=10000))
+    audit_after_first = len(service.repo.get_audit_log(limit=10000, workspace_id=TEST_WS))
 
-    repeat = service.recover_revenue()
+    repeat = service.recover_revenue(TEST_WS)
     assert repeat["executed_now"] == 0 and repeat["blocked_now"] == 3 and repeat["skipped_now"] == 3
     # The stored denials are replayed: a second bulk call writes no new ledger or audit entries.
     assert len(denied()) == 3
-    assert len(service.repo.get_audit_log(limit=10000)) == audit_after_first
+    assert len(service.repo.get_audit_log(limit=10000, workspace_id=TEST_WS)) == audit_after_first
     assert len(provider.calls) == 3
 
 
 def test_bulk_recovery_does_not_retry_a_failed_case():
     clock = FakeClock()
     service, provider = _bulk_fixture(clock=clock)
-    service.recover_revenue()
-    retried_candidates = [c for c in service.repo.list_cases() if c.state == CaseState.ATTEMPTED_NO_RECOVERY]
+    service.recover_revenue(TEST_WS)
+    retried_candidates = [c for c in service.repo.list_cases(workspace_id=TEST_WS) if c.state == CaseState.ATTEMPTED_NO_RECOVERY]
     assert retried_candidates
     clock.advance(hours=48)
     calls = len(provider.calls)
-    again = service.recover_revenue()
+    again = service.recover_revenue(TEST_WS)
     assert again["executed_now"] == 0 and len(provider.calls) == calls   # a retry takes an explicit request
 
 
@@ -930,18 +932,18 @@ def test_bulk_recovery_requires_a_scan():
     repo = InMemoryRepository()
     service = RecoveryService(repo=repo, audit_service=AuditService(repo), provider=ScriptedProvider())
     with pytest.raises(ValueError):
-        service.recover_revenue()
+        service.recover_revenue(TEST_WS)
 
 
 def test_policy_violations_is_computed_from_the_ledger_not_hard_coded():
     service, _ = _bulk_fixture()
-    service.recover_revenue()
-    assert service.recover_revenue()["policy_violations"] == 0
+    service.recover_revenue(TEST_WS)
+    assert service.recover_revenue(TEST_WS)["policy_violations"] == 0
 
     # Corrupt one attempt so it claims an action its authorization did not allow.
-    attempt = service.repo.list_attempts()[0]
+    attempt = service.repo.list_attempts(workspace_id=TEST_WS)[0]
     attempt.authorization = dict(attempt.authorization, final_action="payment_link")
-    assert service.recover_revenue()["policy_violations"] == 1
+    assert service.recover_revenue(TEST_WS)["policy_violations"] == 1
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -949,27 +951,27 @@ def test_policy_violations_is_computed_from_the_ledger_not_hard_coded():
 # ──────────────────────────────────────────────────────────────────────────
 def test_legacy_individual_execution_wrapper_returns_the_intervention_dict():
     service = build_service([make_tx(1)])
-    itv = service.execute_individual_intervention(TX1, idempotency_key="legacy")
+    itv = service.execute_individual_intervention(TEST_WS, TX1, idempotency_key="legacy")
     assert itv["transaction_id"] == TX1 and itv["idempotency_key"] == "legacy"
-    assert service.execute_individual_intervention(TX1, idempotency_key="legacy")["intervention_id"] == itv["intervention_id"]
+    assert service.execute_individual_intervention(TEST_WS, TX1, idempotency_key="legacy")["intervention_id"] == itv["intervention_id"]
 
 
 def test_requests_without_a_key_are_still_guarded_by_case_state():
     provider = ScriptedProvider(["recovered"])
     service = build_service([make_tx(1)], provider=provider)
-    service.execute_case(TX1)
+    service.execute_case(TEST_WS, TX1)
     with pytest.raises(CaseConflict):
-        service.execute_case(TX1)
+        service.execute_case(TEST_WS, TX1)
     assert len(provider.calls) == 1
 
 
 def test_case_detail_exposes_the_ledger():
     service = build_service([make_tx(1)])
-    service.execute_case(TX1, "k")
+    service.execute_case(TEST_WS, TX1, "k")
     case = case_of(service, TX1)
-    detail = service.get_case_detail(case.case_id)
+    detail = service.get_case_detail(TEST_WS, case.case_id)
     assert detail["state"] == "recovered" and detail["attempt_count"] == 1
     assert [a["status"] for a in detail["attempts"]] == ["completed"]
-    assert service.get_case_detail("case_nope") is None
-    assert service.get_cases(state="recovered")[0]["case_id"] == case.case_id
+    assert service.get_case_detail(TEST_WS, "case_nope") is None
+    assert service.get_cases(TEST_WS, state="recovered")[0]["case_id"] == case.case_id
     assert utc_now_iso() >= detail["created_at"]

@@ -140,11 +140,11 @@ class RecoveryService:
         """
         require_demo_workspace(self.repo.get_workspace(merchant_id), merchant_id)
         fingerprint = scan_fingerprint(merchant_id, n_total, seed)
-        previous = self.repo.get_active_run()
+        previous = self.repo.get_active_run(workspace_id=merchant_id)  # THIS workspace's active run, nobody else's
 
-        existing = self.repo.find_run_by_fingerprint(fingerprint)
+        existing = self.repo.find_run_by_fingerprint(fingerprint, workspace_id=merchant_id)
         if existing is not None:
-            run = self.repo.activate_run(existing.run_id)
+            run = self.repo.activate_run(existing.run_id, workspace_id=merchant_id)
             return self._scan_summary(run, reused=True, previous=previous)
 
         df, _ = generate_dataset(n_total=n_total, seed=seed, merchant_id=merchant_id)
@@ -209,7 +209,7 @@ class RecoveryService:
         return self._scan_summary(run, reused=not created, previous=previous)
 
     def _scan_summary(self, run: ScanRun, reused: bool, previous: Optional[ScanRun]) -> Dict[str, Any]:
-        transactions = self.repo.get_all_transactions(run.run_id)
+        transactions = self.repo.get_all_transactions(run.run_id, workspace_id=run.merchant_id)
         by_type: Dict[str, Dict[str, float]] = defaultdict(lambda: {"sum": 0.0, "count": 0})
         for tx in transactions:
             by_type[tx.leak_type]["sum"] += tx.amount
@@ -299,31 +299,33 @@ class RecoveryService:
 
     def _decide_single_case(self, case: RecoveryCase) -> RecoveryCase:
         """Decide one not-yet-analyzed case on demand (model inference runs outside the lock)."""
-        tx = self.repo.get_transaction_by_id(case.transaction_id, case.run_id)
+        tx = self.repo.get_transaction_by_id(case.transaction_id, case.run_id, workspace_id=case.merchant_id)
         prob = tx.model_recovery_prob
         if prob is None:
             prob = float(self._ensure_model().predict_proba(pd.DataFrame([tx.to_dict()]))[0])
         with self.repo.atomic():
-            live = self.repo.get_case(case.case_id)
+            live = self.repo.get_case(case.case_id, workspace_id=case.merchant_id)
             if live.decision_id:  # another request decided it first
                 return live
             tx.model_recovery_prob = prob
-            self.repo.update_transaction_analysis(live.run_id, tx.transaction_id, prob, None)
+            self.repo.update_transaction_analysis(
+                live.run_id, tx.transaction_id, prob, None, workspace_id=live.merchant_id
+            )
             facts = self.executor.policy_facts(tx, live)
             decision = decide_intervention(facts, prob, self.policy, evaluator=evaluate_policy_strict)
             self._record_decision(live, decision, "decision created on demand at execution request", self.policy)
             return live
 
-    def analyze_revenue(self, policy: Optional[PolicyLimits] = None) -> Dict[str, Any]:
+    def analyze_revenue(self, workspace_id: str, policy: Optional[PolicyLimits] = None) -> Dict[str, Any]:
         """
-        Score and decide every case in the active run. Idempotent: a case whose outcome is
+        Score and decide every case in the workspace's active run. Idempotent: a case whose outcome is
         already recorded keeps its decision, and a case whose fresh decision equals the
         current one is left alone (no new decision id, no duplicate audit event). Decisions
         are computed from the attempt ledger, not from the ingested counters alone.
         """
         policy = policy or self.policy
-        run = self.repo.get_active_run()
-        transactions = self.repo.get_all_transactions(run.run_id) if run else []
+        run = self.repo.get_active_run(workspace_id=workspace_id)
+        transactions = self.repo.get_all_transactions(run.run_id, workspace_id=workspace_id) if run else []
         if not transactions:
             raise ValueError("Call /api/scan first.")
 
@@ -340,20 +342,23 @@ class RecoveryService:
         # Read once, in bulk, before taking any lock: the run's current decisions and attempt ledger, and the
         # contact attempts inside the trailing window (any run). They are hints that save thousands of round
         # trips; every case is re-checked under its row lock below, and execution never relies on them.
-        decisions_by_id = {d.decision_id: d for d in self.repo.get_all_decisions(run.run_id)}
+        decisions_by_id = {d.decision_id: d for d in self.repo.get_all_decisions(run.run_id, workspace_id=workspace_id)}
         ledger_by_case: Dict[str, list] = defaultdict(list)
-        for attempt in self.repo.list_attempts(run_id=run.run_id):
+        for attempt in self.repo.list_attempts(run_id=run.run_id, workspace_id=workspace_id):
             ledger_by_case[attempt.case_id].append(attempt)
         contact_attempts: Dict[tuple, list] = defaultdict(list)
         window_start = (self.executor.clock() - CONTACT_WINDOW).isoformat()
-        for attempt in self.repo.list_attempts_since(window_start):
+        for attempt in self.repo.list_attempts_since(window_start, workspace_id=workspace_id):
             if attempt.status in COUNTED_ATTEMPT_STATUSES and attempt.final_action in CUSTOMER_CONTACT_ACTIONS:
                 contact_attempts[(attempt.merchant_id, attempt.customer_id)].append(attempt)
 
         for start in range(0, len(transactions), ANALYZE_CHUNK):
             chunk = transactions[start:start + ANALYZE_CHUNK]
             with self.repo.atomic():  # one unit of work (and one lock acquisition) per chunk of cases
-                locked = {c.transaction_id: c for c in self.repo.lock_cases(run.run_id, [t.transaction_id for t in chunk])}
+                locked = {
+                    c.transaction_id: c
+                    for c in self.repo.lock_cases(run.run_id, [t.transaction_id for t in chunk], workspace_id=workspace_id)
+                }
                 score_rows = []
                 for offset, tx in enumerate(chunk):
                     prob = float(probs[start + offset])
@@ -361,14 +366,16 @@ class RecoveryService:
                     case = locked[tx.transaction_id]
                     current = None
                     if case.decision_id:
-                        current = decisions_by_id.get(case.decision_id) or self.repo.get_decision(case.decision_id)
+                        current = decisions_by_id.get(case.decision_id) or self.repo.get_decision(
+                            case.decision_id, workspace_id=workspace_id
+                        )
                     if current is not None and case.state in FROZEN_CASE_STATES:
                         decision = current  # outcome (or an in-flight attempt) already recorded
                         score_rows.append((tx.transaction_id, prob, None))
                     else:
                         ledger = ledger_by_case.get(case.case_id, [])
                         if sum(1 for a in ledger if a.status in COUNTED_ATTEMPT_STATUSES) != case.attempt_count:
-                            ledger = self.repo.list_attempts(case_id=case.case_id)  # an attempt landed after the bulk read
+                            ledger = self.repo.list_attempts(case_id=case.case_id, workspace_id=workspace_id)  # an attempt landed after the bulk read
                         facts = self.executor.policy_facts(
                             tx, case,
                             planned_contacts=planned_contacts[tx.customer_id],
@@ -390,7 +397,7 @@ class RecoveryService:
                     if not decision.policy_allowed:
                         blocked_count += 1
                     action_counts[decision.final_action] += 1
-                self.repo.update_transaction_analyses(run.run_id, score_rows)
+                self.repo.update_transaction_analyses(run.run_id, score_rows, workspace_id=workspace_id)
 
         self.repo.analyzed = True
 
@@ -426,21 +433,23 @@ class RecoveryService:
         }
 
     # ── reads ────────────────────────────────────────────────────────────
-    def get_transactions(self, limit: int = 100, leak_type: Optional[str] = None) -> List[Dict[str, Any]]:
-        transactions = self.repo.get_all_transactions()
+    def get_transactions(
+        self, workspace_id: str, limit: int = 100, leak_type: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
+        transactions = self.repo.get_all_transactions(workspace_id=workspace_id)
         if leak_type:
             transactions = [tx for tx in transactions if tx.leak_type == leak_type]
         return [tx.to_dict() for tx in transactions[:limit]]
 
-    def get_transaction_by_id(self, tx_id: str) -> Optional[Dict[str, Any]]:
-        tx = self.repo.get_transaction_by_id(tx_id)
+    def get_transaction_by_id(self, workspace_id: str, tx_id: str) -> Optional[Dict[str, Any]]:
+        tx = self.repo.get_transaction_by_id(tx_id, workspace_id=workspace_id)
         return tx.to_dict() if tx else None
 
-    def get_opportunities(self, limit: int = 20) -> List[Dict[str, Any]]:
-        transactions = self.repo.get_all_transactions()
+    def get_opportunities(self, workspace_id: str, limit: int = 20) -> List[Dict[str, Any]]:
+        transactions = self.repo.get_all_transactions(workspace_id=workspace_id)
         # Two bulk reads rather than a case and a decision lookup per transaction.
-        cases_by_tx = {c.transaction_id: c for c in self.repo.list_cases()}
-        decisions_by_id = {d.decision_id: d for d in self.repo.get_all_decisions()}
+        cases_by_tx = {c.transaction_id: c for c in self.repo.list_cases(workspace_id=workspace_id)}
+        decisions_by_id = {d.decision_id: d for d in self.repo.get_all_decisions(workspace_id=workspace_id)}
         results = []
         for tx in transactions:
             case = cases_by_tx.get(tx.transaction_id)
@@ -466,46 +475,54 @@ class RecoveryService:
         results.sort(key=lambda x: x["expected_recovery"], reverse=True)
         return results[:limit]
 
-    def get_decision_by_id(self, key: str) -> Optional[Dict[str, Any]]:
-        decision = self.repo.get_decision(key)
+    def get_decision_by_id(self, workspace_id: str, key: str) -> Optional[Dict[str, Any]]:
+        decision = self.repo.get_decision(key, workspace_id=workspace_id)
         return decision.to_dict() if decision else None
 
-    def get_interventions(self, limit: int = 100, run_id: Optional[str] = None) -> List[Dict[str, Any]]:
-        interventions = self.repo.get_all_interventions(run_id)
+    def get_interventions(
+        self, workspace_id: str, limit: int = 100, run_id: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
+        interventions = self.repo.get_all_interventions(run_id, workspace_id=workspace_id)
         return [i.to_dict() for i in interventions[:limit]]
 
-    def get_escalations(self, limit: int = 50) -> List[Dict[str, Any]]:
-        escalations = self.repo.get_escalations()
+    def get_escalations(self, workspace_id: str, limit: int = 50) -> List[Dict[str, Any]]:
+        escalations = self.repo.get_escalations(workspace_id=workspace_id)
         return [e.to_dict() for e in escalations[:limit]]
 
-    def get_runs(self) -> List[Dict[str, Any]]:
-        return [r.to_dict() for r in self.repo.list_runs()]
+    def get_runs(self, workspace_id: str) -> List[Dict[str, Any]]:
+        return [r.to_dict() for r in self.repo.list_runs(workspace_id=workspace_id)]
 
-    def get_cases(self, limit: int = 100, state: Optional[str] = None, run_id: Optional[str] = None) -> List[Dict[str, Any]]:
-        cases = self.repo.list_cases(run_id)
+    def get_cases(
+        self, workspace_id: str, limit: int = 100, state: Optional[str] = None, run_id: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
+        cases = self.repo.list_cases(run_id, workspace_id=workspace_id)
         if state:
             cases = [c for c in cases if c.state.value == state]
         return [c.to_dict() for c in cases[:limit]]
 
-    def get_case_detail(self, case_id: str) -> Optional[Dict[str, Any]]:
-        case = self.repo.get_case(case_id)
+    def get_case_detail(self, workspace_id: str, case_id: str) -> Optional[Dict[str, Any]]:
+        case = self.repo.get_case(case_id, workspace_id=workspace_id)
         if case is None:
             return None
         detail = case.to_dict()
-        detail["attempts"] = [a.to_dict() for a in self.repo.list_attempts(case_id=case.case_id)]
+        detail["attempts"] = [a.to_dict() for a in self.repo.list_attempts(case_id=case.case_id, workspace_id=workspace_id)]
         return detail
 
     # ── ledger-derived totals ────────────────────────────────────────────
-    def _ledger_totals(self) -> Dict[str, Any]:
+    def _workspace_execution_mode(self, workspace_id: str) -> str:
+        workspace = self.repo.get_workspace(workspace_id)
+        return workspace.execution_mode if workspace is not None else self.provider.execution_mode
+
+    def _ledger_totals(self, workspace_id: str) -> Dict[str, Any]:
         """
         Recovery figures for the active run, derived from the case and attempt ledgers:
         one recovered amount per recovered case, regardless of how many requests,
         replays or attempts touched it.
         """
-        run = self.repo.get_active_run()
-        transactions = self.repo.get_all_transactions()
-        cases = self.repo.list_cases()
-        attempts = self.repo.list_attempts()
+        run = self.repo.get_active_run(workspace_id=workspace_id)
+        transactions = self.repo.get_all_transactions(workspace_id=workspace_id)
+        cases = self.repo.list_cases(workspace_id=workspace_id)
+        attempts = self.repo.list_attempts(workspace_id=workspace_id)
 
         ran = [a for a in attempts if a.status in (AttemptStatus.COMPLETED, AttemptStatus.FAILED)]
         recovery_attempts = [a for a in ran if a.final_action in RECOVERY_ACTIONS]
@@ -537,11 +554,11 @@ class RecoveryService:
             "policy_violations": violations,
         }
 
-    def get_analytics_summary(self) -> Dict[str, Any]:
-        t = self._ledger_totals()
-        decisions = self.repo.get_all_decisions()
+    def get_analytics_summary(self, workspace_id: str) -> Dict[str, Any]:
+        t = self._ledger_totals(workspace_id)
+        decisions = self.repo.get_all_decisions(workspace_id=workspace_id)
         blocked_count = sum(1 for d in decisions if not d.policy_allowed)
-        escalation_count = len(self.repo.get_escalations())
+        escalation_count = len(self.repo.get_escalations(workspace_id=workspace_id))
         total_at_risk, total_recovered = t["total_at_risk"], t["total_recovered"]
         recovered_count, attempted_count = t["recovered_count"], t["attempted_count"]
 
@@ -556,21 +573,24 @@ class RecoveryService:
             "escalation_count": escalation_count,
             "attempted_amount": t["attempted_amount"],
             "run_id": t["run_id"],
-            "execution_mode": self.provider.execution_mode,
+            # The WORKSPACE's mode: a recommend_only workspace never executes, so it must not claim "simulation".
+            "execution_mode": self._workspace_execution_mode(workspace_id),
         }
 
     # ── execution ────────────────────────────────────────────────────────
     def execute_case(
-        self, target_id: str, idempotency_key: Optional[str] = None, expected_action: Optional[str] = None
+        self, workspace_id: str, target_id: str, idempotency_key: Optional[str] = None,
+        expected_action: Optional[str] = None,
     ) -> ExecutionOutcome:
-        return self.executor.execute(target_id, idempotency_key, expected_action)
+        return self.executor.execute(workspace_id, target_id, idempotency_key, expected_action)
 
     def execute_individual_intervention(
-        self, target_id: str, idempotency_key: Optional[str] = None, expected_action: Optional[str] = None
+        self, workspace_id: str, target_id: str, idempotency_key: Optional[str] = None,
+        expected_action: Optional[str] = None,
     ) -> Dict[str, Any]:
-        return self.executor.execute(target_id, idempotency_key, expected_action).intervention
+        return self.executor.execute(workspace_id, target_id, idempotency_key, expected_action).intervention
 
-    def recover_revenue(self) -> Dict[str, Any]:
+    def recover_revenue(self, workspace_id: str) -> Dict[str, Any]:
         """
         Bulk recovery over the active run, through the same `ExecutionService.execute`
         as a single request. Eligible = never attempted and currently authorized (or
@@ -579,14 +599,17 @@ class RecoveryService:
         twice executes nothing the second time. A failed attempt is never auto-retried
         in bulk: that takes an explicit single request.
         """
-        run = self.repo.get_active_run()
-        if run is None or not self.repo.get_all_transactions(run.run_id):
+        # The whole bulk request is refused up front for a workspace that cannot execute (recommend_only, unknown,
+        # provider mismatch): not one case is touched, and nothing is written.
+        self.executor.require_executable_workspace(workspace_id)
+        run = self.repo.get_active_run(workspace_id=workspace_id)
+        if run is None or not self.repo.get_all_transactions(run.run_id, workspace_id=workspace_id):
             raise ValueError("Call /api/analyze first.")
 
         tally = {k: 0 for k in (
             "executed", "recovered", "not_recovered", "suppressed", "escalated", "failed", "blocked", "skipped",
         )}
-        for case in self.repo.list_cases(run.run_id):
+        for case in self.repo.list_cases(run.run_id, workspace_id=workspace_id):
             eligible = (
                 case.state in (CaseState.AUTHORIZED, CaseState.BLOCKED)
                 and case.attempt_count == 0
@@ -599,7 +622,7 @@ class RecoveryService:
             # denial instead of writing a new one.
             key = f"bulk:{case.case_id}:{case.decision_id}"
             try:
-                outcome = self.executor.execute(case.case_id, key)
+                outcome = self.executor.execute(workspace_id, case.case_id, key)
             except (PolicyDenied, ReplayedExecutionError) as e:
                 tally["blocked" if e.code == PolicyDenied.code else "failed"] += 1
                 continue
@@ -624,7 +647,7 @@ class RecoveryService:
 
         self.repo.recovered = True
 
-        t = self._ledger_totals()
+        t = self._ledger_totals(workspace_id)
         total_at_risk, total_recovered = t["total_at_risk"], t["total_recovered"]
         recovered_count, attempted_count = t["recovered_count"], t["attempted_count"]
         return {
@@ -649,8 +672,8 @@ class RecoveryService:
             "skipped_now": tally["skipped"],
         }
 
-    def simulate_policy(self, custom_policy: PolicyLimits) -> Dict[str, Any]:
-        transactions = self.repo.get_all_transactions()
+    def simulate_policy(self, workspace_id: str, custom_policy: PolicyLimits) -> Dict[str, Any]:
+        transactions = self.repo.get_all_transactions(workspace_id=workspace_id)
         if not transactions:
             raise ValueError("Call /api/scan first.")
 
@@ -682,11 +705,11 @@ class RecoveryService:
             "simulated_total_expected_value": round(total_ev, 2),
         }
 
-    def get_demo_blocked_case(self) -> Dict[str, Any]:
+    def get_demo_blocked_case(self, workspace_id: str) -> Dict[str, Any]:
         from backend.app.domain.policy import evaluate_policy
         from backend.app.domain.models import Action
         
-        txs = self.repo.get_all_transactions()
+        txs = self.repo.get_all_transactions(workspace_id=workspace_id)
         if not txs:
             raise ValueError("Call /api/scan first.")
 
@@ -710,24 +733,24 @@ class RecoveryService:
             "final_action": policy_result.final_action,
         }
 
-    def copilot_query(self, query: str, transaction_id: Optional[str] = None) -> Dict[str, Any]:
-        txs = self.repo.get_all_transactions()
+    def copilot_query(self, workspace_id: str, query: str, transaction_id: Optional[str] = None) -> Dict[str, Any]:
+        txs = self.repo.get_all_transactions(workspace_id=workspace_id)
         q_lower = query.lower().strip()
 
         # If specific transaction requested
         target_tx = None
         if transaction_id:
-            target_tx = self.repo.get_transaction_by_id(transaction_id)
+            target_tx = self.repo.get_transaction_by_id(transaction_id, workspace_id=workspace_id)
         elif any(token.startswith("tx_") for token in q_lower.split()):
             for token in q_lower.split():
                 if token.startswith("tx_"):
                     clean_id = token.strip(",.!?")
-                    target_tx = self.repo.get_transaction_by_id(clean_id)
+                    target_tx = self.repo.get_transaction_by_id(clean_id, workspace_id=workspace_id)
                     if target_tx:
                         break
 
         if target_tx:
-            dec = self.repo.get_decision(target_tx.leak_id)
+            dec = self.repo.get_decision(target_tx.leak_id, workspace_id=workspace_id)
             prob_pct = f"{(target_tx.model_recovery_prob or 0.0) * 100:.1f}%"
             candidates_str = ", ".join([f"{c['action']} (EV: ₹{c['expected_value']:.2f}, P: {c['probability']*100:.0f}%)" for c in (dec.candidates_evaluated if dec else [])])
             
@@ -796,9 +819,9 @@ class RecoveryService:
             }
 
         total_amount = sum(t.amount for t in txs)
-        decisions = self.repo.get_all_decisions()  # the current decision of each case in the active run
+        decisions = self.repo.get_all_decisions(workspace_id=workspace_id)  # the current decision of each case in the active run
         blocked_decs = [d for d in decisions if d and not d.policy_allowed]
-        interventions = self.repo.get_all_interventions()
+        interventions = self.repo.get_all_interventions(workspace_id=workspace_id)
         recovered_txs = [i for i in interventions if i.recovered]
         total_recovered = sum(i.recovered_amount for i in recovered_txs)
 

@@ -1,10 +1,12 @@
 import logging
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from backend.app.api.ingestion_routes import router as ingestion_router
 from backend.app.api.routes import router, recovery_service
 from backend.app.config import settings
+from backend.app.domain.workspaces import WorkspaceError
 
 logger = logging.getLogger("revora.main")
 
@@ -24,6 +26,15 @@ app.add_middleware(
 
 app.include_router(router)
 app.include_router(ingestion_router)
+
+
+@app.exception_handler(WorkspaceError)
+async def workspace_error_handler(request: Request, exc: WorkspaceError) -> JSONResponse:
+    """
+    Any refusal by the workspace rules (unknown workspace, ownership mismatch, execution not available...) in the
+    house format: a plain-string `detail`, a machine-readable `code`, and the workspace it was about.
+    """
+    return JSONResponse(status_code=exc.status_code, content=exc.to_body())
 
 
 @app.on_event("startup")

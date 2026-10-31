@@ -1,0 +1,178 @@
+from abc import ABC, abstractmethod
+from typing import Any, ContextManager, Dict, List, Optional, Tuple
+from backend.app.domain.models import (
+    AuditEvent,
+    Decision,
+    ExecutionAttempt,
+    IdempotencyRecord,
+    Intervention,
+    RecoveryCase,
+    ScanRun,
+    Transaction,
+)
+
+# Query scoping. Every run-scoped read takes `run_id`:
+#   None            -> the active scan run (what the dashboard is looking at)
+#   ALL_RUNS ("all")-> history across every run
+#   "<run id>"      -> that specific run
+
+
+class BaseRepository(ABC):
+    # ── concurrency ──────────────────────────────────────────────────────
+    @abstractmethod
+    def atomic(self) -> ContextManager[Any]:
+        """
+        A critical section. Everything read and written inside one `with repo.atomic():`
+        block is isolated from every other `atomic()` block on the same repository
+        (a lock for in-memory storage; a serializable transaction / row lock for a
+        database implementation). Callers keep it short — never hold it across a
+        call to an external provider.
+        """
+
+    # ── scan runs ────────────────────────────────────────────────────────
+    @abstractmethod
+    def register_scan_run(
+        self, run: ScanRun, transactions: List[Transaction], cases: List[RecoveryCase]
+    ) -> Tuple[ScanRun, bool]:
+        """
+        Store a new run with its transactions and cases and make it the active run
+        (the previously active run becomes `superseded`; nothing is deleted). If a
+        run with the same source fingerprint already exists it is re-activated
+        instead and the arguments are discarded. Returns (run, created).
+        """
+
+    @abstractmethod
+    def find_run_by_fingerprint(self, fingerprint: str) -> Optional[ScanRun]:
+        pass
+
+    @abstractmethod
+    def activate_run(self, run_id: str) -> ScanRun:
+        pass
+
+    @abstractmethod
+    def get_active_run(self) -> Optional[ScanRun]:
+        pass
+
+    @abstractmethod
+    def get_run(self, run_id: str) -> Optional[ScanRun]:
+        pass
+
+    @abstractmethod
+    def list_runs(self) -> List[ScanRun]:
+        pass
+
+    # ── transactions (immutable once a run is registered) ────────────────
+    @abstractmethod
+    def get_transaction_by_id(self, tx_id: str, run_id: Optional[str] = None) -> Optional[Transaction]:
+        pass
+
+    @abstractmethod
+    def get_all_transactions(self, run_id: Optional[str] = None) -> List[Transaction]:
+        pass
+
+    # ── recovery cases ───────────────────────────────────────────────────
+    @abstractmethod
+    def save_case(self, case: RecoveryCase):
+        pass
+
+    @abstractmethod
+    def get_case(self, case_id: str) -> Optional[RecoveryCase]:
+        pass
+
+    @abstractmethod
+    def get_case_for_transaction(self, key: str, run_id: Optional[str] = None) -> Optional[RecoveryCase]:
+        """`key` is a transaction_id or leak_id, resolved inside one run."""
+
+    @abstractmethod
+    def list_cases(self, run_id: Optional[str] = None) -> List[RecoveryCase]:
+        pass
+
+    # ── decisions ────────────────────────────────────────────────────────
+    @abstractmethod
+    def save_decision(self, decision: Decision):
+        pass
+
+    @abstractmethod
+    def get_decision(self, decision_id_or_leak_id: str) -> Optional[Decision]:
+        """A decision_id (any run), or a transaction/leak id (resolved to the active run's current decision)."""
+
+    @abstractmethod
+    def get_all_decisions(self, run_id: Optional[str] = None) -> List[Decision]:
+        """The current decision of each case in the run."""
+
+    # ── attempt ledger ───────────────────────────────────────────────────
+    @abstractmethod
+    def save_attempt(self, attempt: ExecutionAttempt):
+        pass
+
+    @abstractmethod
+    def get_attempt(self, attempt_id: str) -> Optional[ExecutionAttempt]:
+        pass
+
+    @abstractmethod
+    def list_attempts(
+        self, case_id: Optional[str] = None, run_id: Optional[str] = None
+    ) -> List[ExecutionAttempt]:
+        """A case's ledger in sequence order, or every attempt in a run when no case is given."""
+
+    @abstractmethod
+    def list_customer_attempts(self, merchant_id: str, customer_id: str) -> List[ExecutionAttempt]:
+        """Attempts against one customer across every run (a person is not scoped to a scan)."""
+
+    # ── idempotency ──────────────────────────────────────────────────────
+    @abstractmethod
+    def get_idempotency_record(self, merchant_id: str, operation: str, key: str) -> Optional[IdempotencyRecord]:
+        pass
+
+    @abstractmethod
+    def save_idempotency_record(self, record: IdempotencyRecord):
+        pass
+
+    # ── interventions ────────────────────────────────────────────────────
+    @abstractmethod
+    def save_intervention(self, intervention: Intervention):
+        pass
+
+    @abstractmethod
+    def get_intervention_by_id(self, intervention_id: str) -> Optional[Intervention]:
+        pass
+
+    @abstractmethod
+    def get_all_interventions(self, run_id: Optional[str] = None) -> List[Intervention]:
+        pass
+
+    @abstractmethod
+    def get_escalations(self, run_id: Optional[str] = None) -> List[Decision]:
+        pass
+
+    # ── audit ────────────────────────────────────────────────────────────
+    @abstractmethod
+    def save_audit_event(self, event: AuditEvent):
+        pass
+
+    @abstractmethod
+    def get_audit_log(
+        self,
+        limit: int = 200,
+        leak_type: Optional[str] = None,
+        status: Optional[str] = None,
+        transaction_id: Optional[str] = None,
+        newest_first: bool = False,
+        run_id: Optional[str] = None,
+    ) -> List[AuditEvent]:
+        pass
+
+    @abstractmethod
+    def summarize_audit_log(
+        self,
+        leak_type: Optional[str] = None,
+        status: Optional[str] = None,
+        transaction_id: Optional[str] = None,
+        run_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Matching-event count and per-event-type counts, before any limit is applied."""
+        pass
+
+    @abstractmethod
+    def clear(self):
+        pass

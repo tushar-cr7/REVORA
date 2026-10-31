@@ -1,0 +1,360 @@
+import threading
+from typing import Any, ContextManager, Dict, List, Optional, Tuple
+from backend.app.domain.models import (
+    ALL_RUNS,
+    AuditEvent,
+    Decision,
+    ExecutionAttempt,
+    IdempotencyRecord,
+    Intervention,
+    RecoveryCase,
+    ScanRun,
+    Transaction,
+    utc_now_iso,
+)
+from backend.app.repositories.base import BaseRepository
+
+
+class InMemoryRepository(BaseRepository):
+    """
+    Process-local storage. Guarantees, and their limits:
+
+    * `atomic()` is a re-entrant lock, so concurrent threads in this process get
+      mutual exclusion across a read-check-write sequence. It does NOT protect
+      against a second process (e.g. several uvicorn workers each get their own
+      repository), and nothing here survives a restart.
+    * Getters return live objects. Mutate them only inside `atomic()`.
+    * Scans never delete: a new run supersedes the old one, and every record keeps
+      the `run_id` it was created under.
+    """
+
+    def __init__(self):
+        self._lock = threading.RLock()
+        self._runs: Dict[str, ScanRun] = {}
+        self._run_by_fingerprint: Dict[str, str] = {}
+        self._active_run_id: Optional[str] = None
+        # transactions: per run, ordered list + (tx_id | leak_id) -> Transaction
+        self._tx_order: Dict[str, List[Transaction]] = {}
+        self._tx_index: Dict[str, Dict[str, Transaction]] = {}
+        # cases
+        self._cases: Dict[str, RecoveryCase] = {}
+        self._cases_by_run: Dict[str, List[str]] = {}
+        self._case_index: Dict[Tuple[str, str], str] = {}  # (run_id, tx_id | leak_id) -> case_id
+        # decisions: every decision ever made, keyed by decision_id (history is kept)
+        self._decisions: Dict[str, Decision] = {}
+        # attempt ledger
+        self._attempts: Dict[str, ExecutionAttempt] = {}
+        self._attempts_by_case: Dict[str, List[str]] = {}
+        self._attempts_by_run: Dict[str, List[str]] = {}
+        self._attempts_by_customer: Dict[Tuple[str, str], List[str]] = {}
+        # idempotency, scoped by (merchant_id, operation, key)
+        self._idempotency: Dict[Tuple[str, str, str], IdempotencyRecord] = {}
+        self._interventions: Dict[str, Intervention] = {}
+        self._audit_log: List[AuditEvent] = []
+        # Legacy progress flags (no longer read by the application).
+        self.scanned: bool = False
+        self.analyzed: bool = False
+        self.recovered: bool = False
+
+    # ── concurrency ──────────────────────────────────────────────────────
+    def atomic(self) -> ContextManager[Any]:
+        return self._lock
+
+    def _scope(self, run_id: Optional[str]) -> Optional[str]:
+        """None -> active run id (None if nothing scanned yet); ALL_RUNS passes through."""
+        if run_id == ALL_RUNS:
+            return ALL_RUNS
+        return run_id or self._active_run_id
+
+    # ── scan runs ────────────────────────────────────────────────────────
+    def register_scan_run(
+        self, run: ScanRun, transactions: List[Transaction], cases: List[RecoveryCase]
+    ) -> Tuple[ScanRun, bool]:
+        with self._lock:
+            existing_id = self._run_by_fingerprint.get(run.source_fingerprint)
+            if existing_id is not None:
+                return self._activate(existing_id), False
+
+            for tx in transactions:
+                tx.run_id = run.run_id
+            for case in cases:
+                if case.run_id != run.run_id:
+                    raise ValueError(f"Case {case.case_id} belongs to run {case.run_id}, not {run.run_id}.")
+
+            self._supersede_active(run.created_at)
+            run.status = "active"
+            run.superseded_at = None
+            self._runs[run.run_id] = run
+            self._run_by_fingerprint[run.source_fingerprint] = run.run_id
+            self._active_run_id = run.run_id
+
+            self._tx_order[run.run_id] = list(transactions)
+            index: Dict[str, Transaction] = {}
+            for tx in transactions:
+                index[tx.transaction_id] = tx
+                index[tx.leak_id] = tx
+            self._tx_index[run.run_id] = index
+
+            self._cases_by_run[run.run_id] = []
+            for case in cases:
+                self._cases[case.case_id] = case
+                self._cases_by_run[run.run_id].append(case.case_id)
+                self._case_index[(run.run_id, case.transaction_id)] = case.case_id
+                self._case_index[(run.run_id, case.leak_id)] = case.case_id
+
+            self.scanned = True
+            self.analyzed = False
+            self.recovered = False
+            return run, True
+
+    def _supersede_active(self, at: str) -> None:
+        if self._active_run_id is not None:
+            current = self._runs[self._active_run_id]
+            current.status = "superseded"
+            current.superseded_at = at
+            self._active_run_id = None
+
+    def _activate(self, run_id: str) -> ScanRun:
+        run = self._runs[run_id]
+        now = utc_now_iso()
+        if self._active_run_id != run_id:
+            self._supersede_active(now)
+            run.status = "active"
+            run.superseded_at = None
+            self._active_run_id = run_id
+        run.scan_count += 1
+        run.last_scanned_at = now
+        return run
+
+    def find_run_by_fingerprint(self, fingerprint: str) -> Optional[ScanRun]:
+        with self._lock:
+            run_id = self._run_by_fingerprint.get(fingerprint)
+            return self._runs.get(run_id) if run_id else None
+
+    def activate_run(self, run_id: str) -> ScanRun:
+        with self._lock:
+            if run_id not in self._runs:
+                raise KeyError(f"Unknown scan run {run_id}.")
+            return self._activate(run_id)
+
+    def get_active_run(self) -> Optional[ScanRun]:
+        with self._lock:
+            return self._runs.get(self._active_run_id) if self._active_run_id else None
+
+    def get_run(self, run_id: str) -> Optional[ScanRun]:
+        with self._lock:
+            return self._runs.get(run_id)
+
+    def list_runs(self) -> List[ScanRun]:
+        with self._lock:
+            return list(self._runs.values())
+
+    # ── transactions ─────────────────────────────────────────────────────
+    def get_transaction_by_id(self, tx_id: str, run_id: Optional[str] = None) -> Optional[Transaction]:
+        with self._lock:
+            rid = run_id if run_id and run_id != ALL_RUNS else self._active_run_id
+            return self._tx_index.get(rid, {}).get(tx_id) if rid else None
+
+    def get_all_transactions(self, run_id: Optional[str] = None) -> List[Transaction]:
+        with self._lock:
+            rid = self._scope(run_id)
+            if rid is None:
+                return []
+            if rid == ALL_RUNS:
+                return [tx for txs in self._tx_order.values() for tx in txs]
+            return list(self._tx_order.get(rid, []))
+
+    # ── cases ────────────────────────────────────────────────────────────
+    def save_case(self, case: RecoveryCase):
+        with self._lock:
+            if case.case_id not in self._cases:
+                raise KeyError(f"Unknown case {case.case_id}; cases are created by register_scan_run.")
+            self._cases[case.case_id] = case
+
+    def get_case(self, case_id: str) -> Optional[RecoveryCase]:
+        with self._lock:
+            return self._cases.get(case_id)
+
+    def get_case_for_transaction(self, key: str, run_id: Optional[str] = None) -> Optional[RecoveryCase]:
+        with self._lock:
+            rid = run_id if run_id and run_id != ALL_RUNS else self._active_run_id
+            case_id = self._case_index.get((rid, key)) if rid else None
+            return self._cases.get(case_id) if case_id else None
+
+    def list_cases(self, run_id: Optional[str] = None) -> List[RecoveryCase]:
+        with self._lock:
+            rid = self._scope(run_id)
+            if rid is None:
+                return []
+            if rid == ALL_RUNS:
+                return list(self._cases.values())
+            return [self._cases[cid] for cid in self._cases_by_run.get(rid, [])]
+
+    # ── decisions ────────────────────────────────────────────────────────
+    def save_decision(self, decision: Decision):
+        with self._lock:
+            self._decisions[decision.decision_id] = decision
+
+    def get_decision(self, key: str) -> Optional[Decision]:
+        with self._lock:
+            decision = self._decisions.get(key)
+            if decision is not None:
+                return decision
+            case = self.get_case_for_transaction(key)
+            if case is not None and case.decision_id:
+                return self._decisions.get(case.decision_id)
+            return None
+
+    def get_all_decisions(self, run_id: Optional[str] = None) -> List[Decision]:
+        with self._lock:
+            return [
+                self._decisions[c.decision_id]
+                for c in self.list_cases(run_id)
+                if c.decision_id and c.decision_id in self._decisions
+            ]
+
+    def get_escalations(self, run_id: Optional[str] = None) -> List[Decision]:
+        with self._lock:
+            return [d for d in self.get_all_decisions(run_id) if d.final_action == "escalate"]
+
+    # ── attempt ledger ───────────────────────────────────────────────────
+    def save_attempt(self, attempt: ExecutionAttempt):
+        with self._lock:
+            first_save = attempt.attempt_id not in self._attempts
+            self._attempts[attempt.attempt_id] = attempt
+            if first_save:
+                self._attempts_by_case.setdefault(attempt.case_id, []).append(attempt.attempt_id)
+                self._attempts_by_run.setdefault(attempt.run_id, []).append(attempt.attempt_id)
+                self._attempts_by_customer.setdefault(
+                    (attempt.merchant_id, attempt.customer_id), []
+                ).append(attempt.attempt_id)
+
+    def get_attempt(self, attempt_id: str) -> Optional[ExecutionAttempt]:
+        with self._lock:
+            return self._attempts.get(attempt_id)
+
+    def list_attempts(
+        self, case_id: Optional[str] = None, run_id: Optional[str] = None
+    ) -> List[ExecutionAttempt]:
+        with self._lock:
+            if case_id is not None:
+                return [self._attempts[a] for a in self._attempts_by_case.get(case_id, [])]
+            rid = self._scope(run_id)
+            if rid is None:
+                return []
+            if rid == ALL_RUNS:
+                return list(self._attempts.values())
+            return [self._attempts[a] for a in self._attempts_by_run.get(rid, [])]
+
+    def list_customer_attempts(self, merchant_id: str, customer_id: str) -> List[ExecutionAttempt]:
+        with self._lock:
+            return [self._attempts[a] for a in self._attempts_by_customer.get((merchant_id, customer_id), [])]
+
+    # ── idempotency ──────────────────────────────────────────────────────
+    def get_idempotency_record(self, merchant_id: str, operation: str, key: str) -> Optional[IdempotencyRecord]:
+        with self._lock:
+            return self._idempotency.get((merchant_id, operation, key))
+
+    def save_idempotency_record(self, record: IdempotencyRecord):
+        with self._lock:
+            self._idempotency[record.scope] = record
+
+    # ── interventions ────────────────────────────────────────────────────
+    def save_intervention(self, intervention: Intervention):
+        with self._lock:
+            self._interventions[intervention.intervention_id] = intervention
+
+    def get_intervention_by_id(self, intervention_id: str) -> Optional[Intervention]:
+        with self._lock:
+            return self._interventions.get(intervention_id)
+
+    def get_all_interventions(self, run_id: Optional[str] = None) -> List[Intervention]:
+        with self._lock:
+            rid = self._scope(run_id)
+            if rid is None:
+                return []
+            items = list(self._interventions.values())
+            if rid == ALL_RUNS:
+                return items
+            # Records written without a run (legacy callers) stay visible rather than vanishing.
+            return [i for i in items if i.run_id is None or i.run_id == rid]
+
+    # ── audit ────────────────────────────────────────────────────────────
+    def save_audit_event(self, event: AuditEvent):
+        with self._lock:
+            self._audit_log.append(event)
+
+    def _filter_audit_log(
+        self,
+        leak_type: Optional[str],
+        status: Optional[str],
+        transaction_id: Optional[str],
+        run_id: Optional[str],
+    ) -> List[AuditEvent]:
+        res = self._audit_log
+        rid = self._scope(run_id)
+        if rid is None:
+            return []
+        if rid != ALL_RUNS:
+            res = [e for e in res if e.run_id is None or e.run_id == rid]
+        if leak_type:
+            res = [e for e in res if e.leak_id.startswith(leak_type[:2]) or e.action == leak_type]
+        if status:
+            res = [e for e in res if e.event_type == status or (e.outcome and e.outcome.get("status") == status)]
+        if transaction_id:
+            res = [e for e in res if e.transaction_id == transaction_id]
+        return res
+
+    def get_audit_log(
+        self,
+        limit: int = 200,
+        leak_type: Optional[str] = None,
+        status: Optional[str] = None,
+        transaction_id: Optional[str] = None,
+        newest_first: bool = False,
+        run_id: Optional[str] = None,
+    ) -> List[AuditEvent]:
+        with self._lock:
+            res = self._filter_audit_log(leak_type, status, transaction_id, run_id)
+            if newest_first:
+                res = res[::-1]
+            return res[:limit]
+
+    def summarize_audit_log(
+        self,
+        leak_type: Optional[str] = None,
+        status: Optional[str] = None,
+        transaction_id: Optional[str] = None,
+        run_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        with self._lock:
+            res = self._filter_audit_log(leak_type, status, transaction_id, run_id)
+            counts_by_type: Dict[str, int] = {}
+            for e in res:
+                counts_by_type[e.event_type] = counts_by_type.get(e.event_type, 0) + 1
+            return {"matched": len(res), "counts_by_type": counts_by_type}
+
+    def clear(self):
+        with self._lock:
+            self._runs.clear()
+            self._run_by_fingerprint.clear()
+            self._active_run_id = None
+            self._tx_order.clear()
+            self._tx_index.clear()
+            self._cases.clear()
+            self._cases_by_run.clear()
+            self._case_index.clear()
+            self._decisions.clear()
+            self._attempts.clear()
+            self._attempts_by_case.clear()
+            self._attempts_by_run.clear()
+            self._attempts_by_customer.clear()
+            self._idempotency.clear()
+            self._interventions.clear()
+            self._audit_log.clear()
+            self.scanned = False
+            self.analyzed = False
+            self.recovered = False
+
+
+repo = InMemoryRepository()

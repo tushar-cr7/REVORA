@@ -1,6 +1,6 @@
 from typing import Optional, List, Dict, Any
 import psycopg2
-from fastapi import APIRouter, Body, Header, HTTPException, Query, Response
+from fastapi import APIRouter, Body, Depends, Header, HTTPException, Query, Response
 from fastapi.responses import JSONResponse
 from backend.app.api.schemas import (
     HealthResponse,
@@ -22,7 +22,7 @@ from backend.app.api.schemas import (
 from backend.app.api.runtime import container, server_error
 from backend.app.domain.models import InvalidCaseTransition
 from backend.app.domain.policy import POLICY_VERSION, PolicyLimits
-from backend.app.domain.workspaces import WorkspaceError
+from backend.app.domain.workspaces import DEMO_WORKSPACE_ID, UnknownWorkspace, WorkspaceError
 from backend.app.services.execution_service import ExecutionError
 
 router = APIRouter(prefix="/api", tags=["revenue"])
@@ -31,6 +31,35 @@ router = APIRouter(prefix="/api", tags=["revenue"])
 repo = container.repo
 audit_service = container.audit_service
 recovery_service = container.recovery_service
+
+
+def workspace_scope(
+    workspace_id: str = Query(
+        default=DEMO_WORKSPACE_ID,
+        min_length=1,
+        max_length=128,
+        description=(
+            "The workspace this request is about. Defaults to the demo workspace so existing clients keep working. "
+            "It is a SELECTION made by the caller, not authentication: nothing proves the caller may use it "
+            "(see docs/PHASE_3_CHECKPOINT.md). Every read and write is confined to this workspace; another "
+            "workspace's records are reported as not found."
+        ),
+    ),
+) -> str:
+    """
+    Resolves `?workspace_id=` to a REGISTERED workspace, or answers 422 `unknown_workspace`. It never creates one.
+    There is no fallback to a global "active run": a workspace with no scan simply has no data.
+    """
+    workspace = repo.get_workspace(workspace_id)
+    if workspace is None:
+        raise UnknownWorkspace(
+            f"Workspace {workspace_id!r} does not exist. Workspaces are never created implicitly.", workspace_id
+        )
+    return workspace.workspace_id
+
+
+def _workspace_error_response(e: WorkspaceError) -> JSONResponse:
+    return JSONResponse(status_code=e.status_code, content=e.to_body())
 
 
 def _execution_error_response(e: ExecutionError) -> JSONResponse:
@@ -80,9 +109,9 @@ def scan_revenue(req: ScanRequest = ScanRequest()):
 
 
 @router.post("/analyze", response_model=AnalyzeResponse)
-def analyze_revenue():
+def analyze_revenue(workspace_id: str = Depends(workspace_scope)):
     try:
-        res = recovery_service.analyze_revenue()
+        res = recovery_service.analyze_revenue(workspace_id)
         return AnalyzeResponse(**res)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -91,9 +120,9 @@ def analyze_revenue():
 
 
 @router.get("/runs")
-def get_runs():
-    runs = recovery_service.get_runs()
-    active = repo.get_active_run()
+def get_runs(workspace_id: str = Depends(workspace_scope)):
+    runs = recovery_service.get_runs(workspace_id)
+    active = repo.get_active_run(workspace_id=workspace_id)
     return {"total": len(runs), "active_run_id": active.run_id if active else None, "runs": runs}
 
 
@@ -101,26 +130,27 @@ def get_runs():
 def get_transactions(
     limit: int = Query(default=100, ge=1, le=1000),
     leak_type: Optional[str] = Query(default=None),
+    workspace_id: str = Depends(workspace_scope),
 ):
-    return recovery_service.get_transactions(limit=limit, leak_type=leak_type)
+    return recovery_service.get_transactions(workspace_id, limit=limit, leak_type=leak_type)
 
 
 @router.get("/transactions/{id}")
-def get_transaction(id: str):
-    tx = recovery_service.get_transaction_by_id(id)
+def get_transaction(id: str, workspace_id: str = Depends(workspace_scope)):
+    tx = recovery_service.get_transaction_by_id(workspace_id, id)
     if not tx:
         raise HTTPException(status_code=404, detail=f"Transaction/leak {id} not found.")
     return tx
 
 
 @router.get("/opportunities")
-def get_opportunities(limit: int = Query(default=20, ge=1, le=100)):
-    return recovery_service.get_opportunities(limit=limit)
+def get_opportunities(limit: int = Query(default=20, ge=1, le=100), workspace_id: str = Depends(workspace_scope)):
+    return recovery_service.get_opportunities(workspace_id, limit=limit)
 
 
 @router.get("/decisions/{id}")
-def get_decision(id: str):
-    dec = recovery_service.get_decision_by_id(id)
+def get_decision(id: str, workspace_id: str = Depends(workspace_scope)):
+    dec = recovery_service.get_decision_by_id(workspace_id, id)
     if not dec:
         raise HTTPException(status_code=404, detail=f"Decision {id} not found.")
     return dec
@@ -130,15 +160,16 @@ def get_decision(id: str):
 def get_cases(
     limit: int = Query(default=100, ge=1, le=1000),
     state: Optional[str] = Query(default=None),
-    run_id: Optional[str] = Query(default=None, description="Defaults to the active run; 'all' for every run."),
+    run_id: Optional[str] = Query(default=None, description="Defaults to the workspace's active run; 'all' for every run of it."),
+    workspace_id: str = Depends(workspace_scope),
 ):
-    cases = recovery_service.get_cases(limit=limit, state=state, run_id=run_id)
+    cases = recovery_service.get_cases(workspace_id, limit=limit, state=state, run_id=run_id)
     return {"total": len(cases), "cases": cases}
 
 
 @router.get("/cases/{case_id}")
-def get_case(case_id: str):
-    case = recovery_service.get_case_detail(case_id)
+def get_case(case_id: str, workspace_id: str = Depends(workspace_scope)):
+    case = recovery_service.get_case_detail(workspace_id, case_id)
     if not case:
         raise HTTPException(status_code=404, detail=f"Case {case_id} not found.")
     return case
@@ -151,6 +182,7 @@ def execute_intervention(
     body: Optional[ExecuteRequest] = Body(default=None),
     idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
     x_idempotency_key: Optional[str] = Header(default=None, alias="X-Idempotency-Key"),
+    workspace_id: str = Depends(workspace_scope),
 ):
     """
     Execute the recovery action authorized for a case (`id` = transaction id, leak id or case id).
@@ -159,13 +191,21 @@ def execute_intervention(
     `Idempotency-Key`: the same key with the same request returns the original result
     (header `Idempotent-Replayed: true`); the same key with a different request is 422.
     409 = refused without effect (policy denial, case not executable, request in flight).
+
+    Execution is only ever available in a `simulation` workspace (the demo workspace). For any other workspace the
+    answer is 409 `execution_not_available`, before a decision is recorded, a key is stored or a provider is called.
+    A case id that belongs to another workspace is 404 `case_not_found`, exactly as if it did not exist.
     """
     key = idempotency_key or x_idempotency_key
     expected = body.expected_action.value if body and body.expected_action else None
     try:
-        outcome = recovery_service.execute_case(target_id=id, idempotency_key=key, expected_action=expected)
+        outcome = recovery_service.execute_case(
+            workspace_id, target_id=id, idempotency_key=key, expected_action=expected
+        )
     except ExecutionError as e:
         return _execution_error_response(e)
+    except WorkspaceError as e:  # before ValueError, which it is a subclass of
+        return _workspace_error_response(e)
     except InvalidCaseTransition as e:
         raise HTTPException(status_code=409, detail=str(e))
     except ValueError as e:
@@ -178,10 +218,12 @@ def execute_intervention(
 
 
 @router.post("/recover", response_model=RecoverResponse)
-def recover_revenue():
+def recover_revenue(workspace_id: str = Depends(workspace_scope)):
     try:
-        res = recovery_service.recover_revenue()
+        res = recovery_service.recover_revenue(workspace_id)
         return RecoverResponse(**res)
+    except WorkspaceError as e:  # e.g. 409 execution_not_available: the whole bulk request is refused up front
+        return _workspace_error_response(e)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
@@ -191,21 +233,22 @@ def recover_revenue():
 @router.get("/interventions", response_model=InterventionsResponse)
 def get_interventions(
     limit: int = Query(default=100, ge=1, le=1000),
-    run_id: Optional[str] = Query(default=None, description="Defaults to the active run; 'all' for every run."),
+    run_id: Optional[str] = Query(default=None, description="Defaults to the workspace's active run; 'all' for every run of it."),
+    workspace_id: str = Depends(workspace_scope),
 ):
-    interventions = recovery_service.get_interventions(limit=limit, run_id=run_id)
+    interventions = recovery_service.get_interventions(workspace_id, limit=limit, run_id=run_id)
     return InterventionsResponse(total=len(interventions), interventions=interventions)
 
 
 @router.get("/escalations", response_model=EscalationsResponse)
-def get_escalations(limit: int = Query(default=50, ge=1, le=1000)):
-    escalations = recovery_service.get_escalations(limit=limit)
+def get_escalations(limit: int = Query(default=50, ge=1, le=1000), workspace_id: str = Depends(workspace_scope)):
+    escalations = recovery_service.get_escalations(workspace_id, limit=limit)
     return EscalationsResponse(total=len(escalations), escalations=escalations)
 
 
 @router.get("/analytics", response_model=AnalyticsResponse)
-def get_analytics():
-    stats = recovery_service.get_analytics_summary()
+def get_analytics(workspace_id: str = Depends(workspace_scope)):
+    stats = recovery_service.get_analytics_summary(workspace_id)
     return AnalyticsResponse(**stats)
 
 
@@ -216,7 +259,8 @@ def get_audit(
     status: Optional[str] = Query(default=None),
     transaction_id: Optional[str] = Query(default=None),
     newest_first: bool = Query(default=False),
-    run_id: Optional[str] = Query(default=None, description="Defaults to the active run; 'all' for full history."),
+    run_id: Optional[str] = Query(default=None, description="Defaults to the workspace's active run; 'all' for its full history."),
+    workspace_id: str = Depends(workspace_scope),
 ):
     entries = audit_service.get_audit_log(
         limit=limit,
@@ -225,9 +269,10 @@ def get_audit(
         transaction_id=transaction_id,
         newest_first=newest_first,
         run_id=run_id,
+        workspace_id=workspace_id,
     )
     summary = audit_service.summarize_audit_log(
-        leak_type=leak_type, status=status, transaction_id=transaction_id, run_id=run_id
+        leak_type=leak_type, status=status, transaction_id=transaction_id, run_id=run_id, workspace_id=workspace_id
     )
     return AuditLogResponse(total=len(entries), entries=entries, **summary)
 
@@ -242,7 +287,7 @@ def get_policies():
 
 
 @router.post("/simulate", response_model=PolicySimulateResponse)
-def simulate_policy(req: PolicySimulateRequest):
+def simulate_policy(req: PolicySimulateRequest, workspace_id: str = Depends(workspace_scope)):
     base = recovery_service.policy
     custom_policy = PolicyLimits(
         max_retries=req.max_retries if req.max_retries is not None else base.max_retries,
@@ -253,16 +298,16 @@ def simulate_policy(req: PolicySimulateRequest):
         invoice_escalation_age_days=req.invoice_escalation_age_days if req.invoice_escalation_age_days is not None else base.invoice_escalation_age_days,
     )
     try:
-        res = recovery_service.simulate_policy(custom_policy)
+        res = recovery_service.simulate_policy(workspace_id, custom_policy)
         return PolicySimulateResponse(**res)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
 
 @router.post("/demo/force-retry-block", response_model=ForceRetryBlockResponse)
-def demo_force_retry_block():
+def demo_force_retry_block(workspace_id: str = Depends(workspace_scope)):
     try:
-        res = recovery_service.get_demo_blocked_case()
+        res = recovery_service.get_demo_blocked_case(workspace_id)
         return ForceRetryBlockResponse(**res)
     except ValueError as e:
         if "Call /api/scan first" in str(e):
@@ -271,9 +316,9 @@ def demo_force_retry_block():
 
 
 @router.post("/copilot/query", response_model=CopilotQueryResponse)
-def query_copilot(req: CopilotQueryRequest):
+def query_copilot(req: CopilotQueryRequest, workspace_id: str = Depends(workspace_scope)):
     try:
-        res = recovery_service.copilot_query(query=req.query, transaction_id=req.transaction_id)
+        res = recovery_service.copilot_query(workspace_id, query=req.query, transaction_id=req.transaction_id)
         return CopilotQueryResponse(**res)
     except Exception as e:
         raise server_error("Copilot query failed", e)

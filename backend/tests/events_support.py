@@ -3,11 +3,16 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional
 
 from backend.app.domain.events import EventType
+from backend.app.domain.workspaces import new_workspace
 from backend.app.ingestion.schemas import NormalizedEventIn
 from backend.app.services.audit_service import AuditService
 from backend.app.services.detection_service import DetectionService
 from backend.app.services.ingestion_service import IngestionService
 from backend.tests.support import FakeClock
+
+# The workspace the event fixtures name unless a test says otherwise, and the other merchants the suites use.
+EVENTS_WS = "merch_a"
+FIXTURE_MERCHANTS = ("merch_a", "merch_b", "merch_pg", "merch_r")
 
 T0 = datetime(2026, 10, 20, 10, 0, 0, tzinfo=timezone.utc)
 SERVER_NOW = datetime(2026, 10, 22, 12, 0, 0, tzinfo=timezone.utc)  # after every fixture timestamp
@@ -65,11 +70,19 @@ def parsed(**kwargs) -> NormalizedEventIn:
     return NormalizedEventIn.model_validate(event(**kwargs))
 
 
+def ensure_event_workspace(repo, workspace_id: str, kind: str = "merchant") -> None:
+    """Register the workspace an event names, explicitly: ingestion rejects events about unknown workspaces."""
+    if repo.get_workspace(workspace_id) is None:
+        repo.create_workspace(new_workspace(workspace_id, kind, f"Fixture workspace {workspace_id}"))
+
+
 class Pipeline:
     """Ingestion + detection over a repository, with a fixed server clock."""
 
     def __init__(self, repo, now: datetime = SERVER_NOW):
         self.repo = repo
+        for merchant in FIXTURE_MERCHANTS:
+            ensure_event_workspace(repo, merchant)
         self.clock = FakeClock(now)
         self.audit = AuditService(repo)
         self.detection = DetectionService(repo, self.audit, clock=self.clock)
@@ -81,8 +94,10 @@ class Pipeline:
     def obligation(self, merchant: str = "merch_a", kind: str = "payment", ref: str = "ord_1"):
         from backend.app.domain.events import obligation_internal_id
 
-        return self.repo.get_obligation(obligation_internal_id(merchant, kind, ref))
+        return self.repo.get_obligation(obligation_internal_id(merchant, kind, ref), workspace_id=merchant)
 
     def case_of(self, obligation=None, **kwargs):
         obligation = obligation or self.obligation(**kwargs)
-        return self.repo.get_case(obligation.case_id) if obligation and obligation.case_id else None
+        if obligation and obligation.case_id:
+            return self.repo.get_case(obligation.case_id, workspace_id=obligation.merchant_id)
+        return None

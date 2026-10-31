@@ -13,10 +13,15 @@ from backend.app.domain.models import (
     Transaction,
 )
 
-# Query scoping. Every run-scoped read takes `run_id`:
-#   None            -> the active scan run (what the dashboard is looking at)
-#   ALL_RUNS ("all")-> history across every run
-#   "<run id>"      -> that specific run
+# Workspace scoping (Phase 3.1). Every method that reads or changes workspace-owned records takes a REQUIRED
+# keyword-only `workspace_id`; there is no default and no fallback to "whichever run is active". A record that
+# belongs to another workspace is simply not found (None / empty / KeyError), never returned. `workspace_id` is the
+# workspace the CALLER selected: it is not authentication (see docs/PHASE_3_CHECKPOINT.md).
+#
+# Run-scoped reads additionally take `run_id`:
+#   None            -> that workspace's ACTIVE scan run (nothing at all if it has none: never another workspace's)
+#   ALL_RUNS ("all")-> history across every run OF THAT WORKSPACE
+#   "<run id>"      -> that specific run, but only if it belongs to the workspace
 
 
 class BaseRepository(ABC):
@@ -93,37 +98,40 @@ class BaseRepository(ABC):
         """
 
     @abstractmethod
-    def find_run_by_fingerprint(self, fingerprint: str) -> Optional[ScanRun]:
+    def find_run_by_fingerprint(self, fingerprint: str, *, workspace_id: str) -> Optional[ScanRun]:
         pass
 
     @abstractmethod
-    def activate_run(self, run_id: str) -> ScanRun:
+    def activate_run(self, run_id: str, *, workspace_id: str) -> ScanRun:
+        """Make a run of this workspace its active run (its previous active run is superseded; no other workspace is touched)."""
+
+    @abstractmethod
+    def get_active_run(self, *, workspace_id: str) -> Optional[ScanRun]:
+        """The workspace's active run, or None. Each workspace has at most one, enforced by the database."""
+
+    @abstractmethod
+    def get_run(self, run_id: str, *, workspace_id: str) -> Optional[ScanRun]:
         pass
 
     @abstractmethod
-    def get_active_run(self) -> Optional[ScanRun]:
-        pass
-
-    @abstractmethod
-    def get_run(self, run_id: str) -> Optional[ScanRun]:
-        pass
-
-    @abstractmethod
-    def list_runs(self) -> List[ScanRun]:
+    def list_runs(self, *, workspace_id: str) -> List[ScanRun]:
         pass
 
     # ── transactions (immutable once a run is registered) ────────────────
     @abstractmethod
-    def get_transaction_by_id(self, tx_id: str, run_id: Optional[str] = None) -> Optional[Transaction]:
+    def get_transaction_by_id(
+        self, tx_id: str, run_id: Optional[str] = None, *, workspace_id: str
+    ) -> Optional[Transaction]:
         pass
 
     @abstractmethod
-    def get_all_transactions(self, run_id: Optional[str] = None) -> List[Transaction]:
+    def get_all_transactions(self, run_id: Optional[str] = None, *, workspace_id: str) -> List[Transaction]:
         pass
 
     @abstractmethod
     def update_transaction_analysis(
-        self, run_id: str, transaction_id: str, model_recovery_prob: Optional[float], contacts_today: Optional[int]
+        self, run_id: str, transaction_id: str, model_recovery_prob: Optional[float], contacts_today: Optional[int],
+        *, workspace_id: str,
     ) -> None:
         """
         Persist the two figures analysis computes onto a transaction: the model's recovery
@@ -133,12 +141,12 @@ class BaseRepository(ABC):
 
     @abstractmethod
     def update_transaction_analyses(
-        self, run_id: str, rows: Sequence[Tuple[str, Optional[float], Optional[int]]]
+        self, run_id: str, rows: Sequence[Tuple[str, Optional[float], Optional[int]]], *, workspace_id: str
     ) -> None:
         """`update_transaction_analysis` for many transactions: (transaction_id, probability, contacts_today or None)."""
 
     @abstractmethod
-    def lock_cases(self, run_id: str, transaction_ids: Sequence[str]) -> List[RecoveryCase]:
+    def lock_cases(self, run_id: str, transaction_ids: Sequence[str], *, workspace_id: str) -> List[RecoveryCase]:
         """
         The cases of these transactions in one run, in run order, row-locked until the enclosing
         `atomic()` section ends (a database); the same objects the single-case getters return
@@ -151,15 +159,17 @@ class BaseRepository(ABC):
         pass
 
     @abstractmethod
-    def get_case(self, case_id: str) -> Optional[RecoveryCase]:
-        pass
+    def get_case(self, case_id: str, *, workspace_id: str) -> Optional[RecoveryCase]:
+        """The case, only if it belongs to `workspace_id` (another workspace's case id is just not found)."""
 
     @abstractmethod
-    def get_case_for_transaction(self, key: str, run_id: Optional[str] = None) -> Optional[RecoveryCase]:
-        """`key` is a transaction_id or leak_id, resolved inside one run."""
+    def get_case_for_transaction(
+        self, key: str, run_id: Optional[str] = None, *, workspace_id: str
+    ) -> Optional[RecoveryCase]:
+        """`key` is a transaction_id or leak_id, resolved inside one run of the workspace."""
 
     @abstractmethod
-    def list_cases(self, run_id: Optional[str] = None) -> List[RecoveryCase]:
+    def list_cases(self, run_id: Optional[str] = None, *, workspace_id: str) -> List[RecoveryCase]:
         pass
 
     # ── decisions ────────────────────────────────────────────────────────
@@ -168,11 +178,11 @@ class BaseRepository(ABC):
         pass
 
     @abstractmethod
-    def get_decision(self, decision_id_or_leak_id: str) -> Optional[Decision]:
-        """A decision_id (any run), or a transaction/leak id (resolved to the active run's current decision)."""
+    def get_decision(self, decision_id_or_leak_id: str, *, workspace_id: str) -> Optional[Decision]:
+        """A decision_id (any run of the workspace), or a transaction/leak id (resolved to the active run's current decision)."""
 
     @abstractmethod
-    def get_all_decisions(self, run_id: Optional[str] = None) -> List[Decision]:
+    def get_all_decisions(self, run_id: Optional[str] = None, *, workspace_id: str) -> List[Decision]:
         """The current decision of each case in the run."""
 
     # ── attempt ledger ───────────────────────────────────────────────────
@@ -181,26 +191,30 @@ class BaseRepository(ABC):
         pass
 
     @abstractmethod
-    def get_attempt(self, attempt_id: str) -> Optional[ExecutionAttempt]:
+    def get_attempt(self, attempt_id: str, *, workspace_id: str) -> Optional[ExecutionAttempt]:
         pass
 
     @abstractmethod
     def list_attempts(
-        self, case_id: Optional[str] = None, run_id: Optional[str] = None
+        self, case_id: Optional[str] = None, run_id: Optional[str] = None, *, workspace_id: str
     ) -> List[ExecutionAttempt]:
         """A case's ledger in sequence order, or every attempt in a run when no case is given."""
 
     @abstractmethod
     def list_customer_attempts(self, merchant_id: str, customer_id: str) -> List[ExecutionAttempt]:
-        """Attempts against one customer across every run (a person is not scoped to a scan)."""
+        """Attempts against one customer of one workspace (`merchant_id`) across every run (a person is not scoped to a scan)."""
 
     @abstractmethod
-    def list_attempts_since(self, created_since: str) -> List[ExecutionAttempt]:
-        """Every attempt, in any run, created at or after `created_since` (ISO 8601). Bounded by the window."""
+    def list_attempts_since(self, created_since: str, *, workspace_id: str) -> List[ExecutionAttempt]:
+        """Every attempt of the workspace, in any of its runs, created at or after `created_since` (ISO 8601)."""
 
     @abstractmethod
     def list_reserved_attempts(self, created_before: str) -> List[ExecutionAttempt]:
-        """Attempts still `reserved` that were reserved before `created_before` (ISO 8601), oldest first, all runs."""
+        """
+        Attempts still `reserved` that were reserved before `created_before` (ISO 8601), oldest first.
+        DELIBERATELY spans every workspace: it is the system's interrupted-execution sweep (startup), never an
+        API read. Each attempt names its own workspace, which the sweep must use for everything it does next.
+        """
 
     # ── idempotency ──────────────────────────────────────────────────────
     @abstractmethod
@@ -221,15 +235,15 @@ class BaseRepository(ABC):
         pass
 
     @abstractmethod
-    def get_intervention_by_id(self, intervention_id: str) -> Optional[Intervention]:
+    def get_intervention_by_id(self, intervention_id: str, *, workspace_id: str) -> Optional[Intervention]:
         pass
 
     @abstractmethod
-    def get_all_interventions(self, run_id: Optional[str] = None) -> List[Intervention]:
+    def get_all_interventions(self, run_id: Optional[str] = None, *, workspace_id: str) -> List[Intervention]:
         pass
 
     @abstractmethod
-    def get_escalations(self, run_id: Optional[str] = None) -> List[Decision]:
+    def get_escalations(self, run_id: Optional[str] = None, *, workspace_id: str) -> List[Decision]:
         pass
 
     # ── audit ────────────────────────────────────────────────────────────
@@ -246,6 +260,8 @@ class BaseRepository(ABC):
         transaction_id: Optional[str] = None,
         newest_first: bool = False,
         run_id: Optional[str] = None,
+        *,
+        workspace_id: str,
     ) -> List[AuditEvent]:
         pass
 
@@ -256,6 +272,8 @@ class BaseRepository(ABC):
         status: Optional[str] = None,
         transaction_id: Optional[str] = None,
         run_id: Optional[str] = None,
+        *,
+        workspace_id: str,
     ) -> Dict[str, Any]:
         """Matching-event count and per-event-type counts, before any limit is applied."""
         pass
@@ -263,11 +281,17 @@ class BaseRepository(ABC):
     # ── source events, obligations, ingestion run (Phase 2) ──────────────
     @abstractmethod
     def get_or_create_ingestion_run(self, merchant_id: str, now_iso: str) -> ScanRun:
-        """The standing, never-activated run that holds a merchant's event-derived cases."""
+        """
+        The standing, never-activated run that holds a workspace's event-derived cases. The workspace must be
+        registered (UnknownWorkspace otherwise): an ingestion run is never created for an unverified claim.
+        """
 
     @abstractmethod
     def create_case(self, case: RecoveryCase, transaction: Transaction) -> None:
-        """Add one transaction and its case to an EXISTING ingestion run. Refuses a scan run."""
+        """
+        Add one transaction and its case to an EXISTING ingestion run. Refuses a scan run, and a case or
+        transaction that names another workspace than the run (WorkspaceMismatch).
+        """
 
     @abstractmethod
     def update_source_transaction(self, transaction: Transaction) -> None:
@@ -282,18 +306,19 @@ class BaseRepository(ABC):
         """
 
     @abstractmethod
-    def get_source_event(self, event_id: str) -> Optional[SourceEvent]:
+    def get_source_event(self, event_id: str, *, workspace_id: str) -> Optional[SourceEvent]:
         pass
 
     @abstractmethod
     def list_source_events(
         self,
-        merchant_id: Optional[str] = None,
         processing_status: Optional[str] = None,
         source: Optional[str] = None,
         limit: int = 100,
+        *,
+        workspace_id: str,
     ) -> List[SourceEvent]:
-        """Newest-received first."""
+        """The workspace's events, newest-received first."""
 
     @abstractmethod
     def list_events_for_reference(self, merchant_id: str, reference_kind: str, reference_id: str) -> List[SourceEvent]:
@@ -301,7 +326,8 @@ class BaseRepository(ABC):
 
     @abstractmethod
     def mark_source_event(
-        self, event_id: str, processing_status: str, failure_reason: Optional[str], processed_at: str
+        self, event_id: str, processing_status: str, failure_reason: Optional[str], processed_at: str,
+        *, workspace_id: str,
     ) -> None:
         pass
 
@@ -316,12 +342,12 @@ class BaseRepository(ABC):
         pass
 
     @abstractmethod
-    def get_obligation(self, obligation_id: str) -> Optional[RevenueObligation]:
+    def get_obligation(self, obligation_id: str, *, workspace_id: str) -> Optional[RevenueObligation]:
         pass
 
     @abstractmethod
     def list_obligations(
-        self, merchant_id: Optional[str] = None, status: Optional[str] = None, limit: int = 100
+        self, status: Optional[str] = None, limit: int = 100, *, workspace_id: str
     ) -> List[RevenueObligation]:
         pass
 

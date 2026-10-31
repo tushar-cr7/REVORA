@@ -14,6 +14,7 @@ import pytest
 
 from backend.app.domain.models import AttemptStatus, CaseState
 from backend.tests.support import FakeClock, ScriptedProvider, build_service, case_of, make_tx
+from backend.tests.support import TEST_WS
 
 ROOT = Path(__file__).resolve().parents[3]
 SECRET = "Sup3rS3cretPw"
@@ -83,13 +84,13 @@ SECOND_PROCESS = """
 
 def test_the_whole_application_state_survives_a_real_process_restart(pg_dsn, pg_schema):
     migrate = run_python("import sys; from backend.app.db.migrate import main; sys.exit(main(['upgrade']))", app_env(pg_dsn, pg_schema))
-    assert migrate.returncode == 0 and "applied: [1, 2, 3]" in migrate.stdout, migrate.stderr
+    assert migrate.returncode == 0 and "applied: [1, 2, 3, 4]" in migrate.stdout, migrate.stderr
     status = run_python("import sys; from backend.app.db.migrate import main; sys.exit(main(['status']))", app_env(pg_dsn, pg_schema))
-    assert "current=3" in status.stdout and "pending=[]" in status.stdout
+    assert "current=4" in status.stdout and "pending=[]" in status.stdout
 
     first = last_json(run_python(FIRST_PROCESS, app_env(pg_dsn, pg_schema)))
     assert first["ready"]["status"] == "ok" and first["ready"]["storage"]["durable"] is True
-    assert first["ready"]["storage"]["backend"] == "postgres" and first["ready"]["storage"]["schema_version"] == 3
+    assert first["ready"]["storage"]["backend"] == "postgres" and first["ready"]["storage"]["schema_version"] == 4
     assert first["status"] == 200 and first["intervention"]["execution_mode"] == "simulation"
     assert first["cases"] == 80 and first["interventions"] == 1 and first["audit"] >= 80
 
@@ -113,22 +114,22 @@ def test_startup_closes_reservations_a_dead_process_left_open(pg_dsn, pg_schema,
     provider = ScriptedProvider(["recovered"])
     service = build_service([make_tx(1, amount=1500.0)], provider=provider, clock=clock, repo=pg_repo)
     case = case_of(service, "tx_fp_000001")
-    reservation = service.executor._reserve_with_retry(case.case_id, "died-mid-flight", None)
-    assert pg_repo.get_case(case.case_id).state == CaseState.EXECUTING
+    reservation = service.executor._reserve_with_retry(TEST_WS, case.case_id, "died-mid-flight", None)
+    assert pg_repo.get_case(case.case_id, workspace_id=TEST_WS).state == CaseState.EXECUTING
 
     code = f"""
         import json
         from fastapi.testclient import TestClient
         from backend.app.main import app
         with TestClient(app) as client:                 # the startup hook sweeps interrupted reservations
-            detail = client.get("/api/cases/{case.case_id}").json()
+            detail = client.get("/api/cases/{case.case_id}", params={{"workspace_id": "{TEST_WS}"}}).json()
             print(json.dumps({{"state": detail["state"], "active": detail["active_attempt_id"],
                               "attempt": detail["attempts"][0]["status"], "reason": detail["attempts"][0]["failure_reason"]}}))
     """
     result = last_json(run_python(code, app_env(pg_dsn, pg_schema)))
     assert result["state"] == "attempted_no_recovery" and result["active"] is None and result["attempt"] == "failed"
     assert result["reason"].startswith("interrupted:")
-    assert pg_repo.get_attempt(reservation.attempt_id).status == AttemptStatus.FAILED
+    assert pg_repo.get_attempt(reservation.attempt_id, workspace_id=TEST_WS).status == AttemptStatus.FAILED
 
 
 @pytest.mark.parametrize(
@@ -163,7 +164,7 @@ def test_auto_migrate_is_opt_in_and_works(pg_dsn, pg_schema):
         app_env(pg_dsn, pg_schema, REVORA_DB_AUTO_MIGRATE="1"),
     )
     assert proc.returncode == 0, proc.stderr[-2000:]
-    assert "'durable': True" in proc.stdout and "'schema_version': 3" in proc.stdout
+    assert "'durable': True" in proc.stdout and "'schema_version': 4" in proc.stdout
 
 
 def test_memory_mode_is_explicit_and_reported_as_not_durable():
